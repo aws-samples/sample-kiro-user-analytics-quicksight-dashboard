@@ -1,0 +1,703 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Kiro User Analytics - QuickSight DataSource + DataSets (native CFN).
+  Analysis and Dashboard are created by scripts/create_dashboard.py via boto3
+  for ease of editing the Definition payload in Python.
+
+Parameters:
+  GlueDatabase:
+    Type: String
+    Default: kiro_analytics
+  AthenaWorkgroup:
+    Type: String
+    Default: kiro_analytics
+  QuickSightPrincipalArn:
+    Type: String
+  ResourcePrefix:
+    Type: String
+    Default: kiro-analytics
+    Description: >
+      Prefix for QuickSight resource IDs (DataSource, DataSets, Theme,
+      RefreshSchedule). Lets you stand up multiple parallel deployments in
+      the same account without ID collisions.
+  ThemeMode:
+    Type: String
+    Default: light
+    AllowedValues: [light, dark]
+    Description: >
+      light  -> SEASIDE base, white background, dark text
+      dark   -> MIDNIGHT base, dark background, light text
+      Categorical color palette (Kiro purple lead) is the same either way.
+
+Conditions:
+  IsDarkMode: !Equals [!Ref ThemeMode, dark]
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # QuickSight theme - applied to the Analysis and Dashboard via ThemeArn.
+  # ---------------------------------------------------------------------------
+  KiroTheme:
+    Type: AWS::QuickSight::Theme
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      ThemeId: !Sub "${ResourcePrefix}-theme"
+      Name: !Sub "Kiro Analytics (${ThemeMode})"
+      BaseThemeId: !If [IsDarkMode, MIDNIGHT, SEASIDE]
+      Configuration:
+        DataColorPalette:
+          # Same categorical palette in both modes - Kiro purple leads.
+          Colors:
+            - "#9046FF"   # Kiro purple
+            - "#FF8C00"   # warm orange
+            - "#0972D3"   # AWS blue
+            - "#E7157B"   # magenta
+            - "#7AA116"   # olive
+            - "#F7C600"   # amber
+            - "#00A4A6"   # teal
+            - "#CD2264"   # crimson
+          MinMaxGradient:
+            - !If [IsDarkMode, "#1A0033", "#F4ECFF"]
+            - "#9046FF"
+          EmptyFillColor: !If [IsDarkMode, "#2B2B2B", "#F2F2F2"]
+        UIColorPalette:
+          PrimaryBackground:    !If [IsDarkMode, "#0F0F1A", "#FFFFFF"]
+          PrimaryForeground:    !If [IsDarkMode, "#FFFFFF", "#232F3E"]
+          SecondaryBackground:  !If [IsDarkMode, "#1A1A2E", "#F4F4F4"]
+          SecondaryForeground:  !If [IsDarkMode, "#E0E0E0", "#414D5C"]
+          Accent:               "#9046FF"
+          AccentForeground:     "#FFFFFF"
+          Danger:               !If [IsDarkMode, "#E7157B", "#D13212"]
+          DangerForeground:     "#FFFFFF"
+          Warning:              "#FF8C00"
+          WarningForeground:    "#FFFFFF"
+          Success:              !If [IsDarkMode, "#7AA116", "#3F8624"]
+          SuccessForeground:    "#FFFFFF"
+          Dimension:            "#9046FF"
+          DimensionForeground:  "#FFFFFF"
+          Measure:              "#FF8C00"
+          MeasureForeground:    "#FFFFFF"
+        Sheet:
+          Tile:
+            Border: { Show: true }
+          TileLayout:
+            Margin:  { Show: true }
+            Gutter:  { Show: true }
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - quicksight:CreateThemeAlias
+            - quicksight:DeleteTheme
+            - quicksight:DeleteThemeAlias
+            - quicksight:DescribeTheme
+            - quicksight:DescribeThemeAlias
+            - quicksight:DescribeThemePermissions
+            - quicksight:ListThemeAliases
+            - quicksight:ListThemeVersions
+            - quicksight:UpdateTheme
+            - quicksight:UpdateThemeAlias
+            - quicksight:UpdateThemePermissions
+
+  # ---------------------------------------------------------------------------
+  # Athena data source - the only data source in this template; all
+  # DataSets below sit on top of it.
+  # ---------------------------------------------------------------------------
+  AthenaDataSource:
+    Type: AWS::QuickSight::DataSource
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSourceId: !Sub "${ResourcePrefix}-athena"
+      Name: Kiro Analytics - Athena
+      Type: ATHENA
+      DataSourceParameters:
+        AthenaParameters:
+          WorkGroup: !Ref AthenaWorkgroup
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - quicksight:UpdateDataSourcePermissions
+            - quicksight:DescribeDataSource
+            - quicksight:DescribeDataSourcePermissions
+            - quicksight:PassDataSource
+            - quicksight:UpdateDataSource
+            - quicksight:DeleteDataSource
+
+  # ---------------------------------------------------------------------------
+  # DataSet over base_user_activity - the deduped, normalized fact
+  # table. Every other view derives from this one.
+  # ---------------------------------------------------------------------------
+  BaseUserActivityDataSet:
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "${ResourcePrefix}-base-user-activity"
+      Name: Kiro - Base User Activity
+      ImportMode: SPICE
+      PhysicalTableMap:
+        base:
+          RelationalTable:
+            DataSourceArn: !GetAtt AthenaDataSource.Arn
+            Catalog: AwsDataCatalog
+            Schema: !Ref GlueDatabase
+            Name: base_user_activity
+            InputColumns:
+              - { Name: activity_date,         Type: DATETIME }
+              - { Name: user_id,               Type: STRING }
+              - { Name: email,                 Type: STRING }
+              - { Name: user_label,            Type: STRING }
+              - { Name: client_type,           Type: STRING }
+              - { Name: subscription_tier,     Type: STRING }
+              - { Name: profile_id,            Type: STRING }
+              - { Name: new_user,              Type: BOOLEAN }
+              - { Name: chat_conversations,    Type: INTEGER }
+              - { Name: total_messages,        Type: INTEGER }
+              - { Name: credits_used,          Type: DECIMAL }
+              - { Name: overage_cap,           Type: DECIMAL }
+              - { Name: overage_credits_used,  Type: DECIMAL }
+              - { Name: overage_enabled,       Type: BOOLEAN }
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - quicksight:DescribeDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:PassDataSet
+            - quicksight:DescribeIngestion
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DeleteDataSet
+            - quicksight:CreateIngestion
+            - quicksight:CancelIngestion
+            - quicksight:UpdateDataSetPermissions
+
+  # ---------------------------------------------------------------------------
+  # DataSet over daily_trends - per-day active users, messages, and
+  # credits used. Powers the Activity & Trends sheet lines.
+  # ---------------------------------------------------------------------------
+  DailyTrendsDataSet:
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "${ResourcePrefix}-daily-trends"
+      Name: Kiro - Daily Trends
+      ImportMode: SPICE
+      PhysicalTableMap:
+        base:
+          RelationalTable:
+            DataSourceArn: !GetAtt AthenaDataSource.Arn
+            Catalog: AwsDataCatalog
+            Schema: !Ref GlueDatabase
+            Name: daily_trends
+            InputColumns:
+              - { Name: activity_date,        Type: DATETIME }
+              - { Name: client_type,          Type: STRING }
+              - { Name: active_users,         Type: INTEGER }
+              - { Name: total_messages,       Type: INTEGER }
+              - { Name: total_conversations,  Type: INTEGER }
+              - { Name: credits_used,         Type: DECIMAL }
+              - { Name: overage_credits_used, Type: DECIMAL }
+              - { Name: new_users,            Type: INTEGER }
+              - { Name: returning_users,      Type: INTEGER }
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - quicksight:DescribeDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:PassDataSet
+            - quicksight:DescribeIngestion
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DeleteDataSet
+            - quicksight:CreateIngestion
+            - quicksight:CancelIngestion
+            - quicksight:UpdateDataSetPermissions
+
+  # ---------------------------------------------------------------------------
+  # DataSet over user_totals - lifetime per-user rollups. Powers the
+  # All Users table and the User detail sheet.
+  # ---------------------------------------------------------------------------
+  UserTotalsDataSet:
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "${ResourcePrefix}-user-totals"
+      Name: Kiro - User Totals
+      ImportMode: SPICE
+      PhysicalTableMap:
+        base:
+          RelationalTable:
+            DataSourceArn: !GetAtt AthenaDataSource.Arn
+            Catalog: AwsDataCatalog
+            Schema: !Ref GlueDatabase
+            Name: user_totals
+            InputColumns:
+              - { Name: user_id,              Type: STRING }
+              - { Name: user_label,           Type: STRING }
+              - { Name: email,                Type: STRING }
+              - { Name: subscription_tier,    Type: STRING }
+              - { Name: profile_id,           Type: STRING }
+              - { Name: first_active_date,    Type: DATETIME }
+              - { Name: last_active_date,     Type: DATETIME }
+              - { Name: active_days,          Type: INTEGER }
+              - { Name: total_messages,       Type: INTEGER }
+              - { Name: total_conversations,  Type: INTEGER }
+              - { Name: credits_used,         Type: DECIMAL }
+              - { Name: overage_credits_used, Type: DECIMAL }
+              - { Name: overage_enabled,      Type: BOOLEAN }
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - quicksight:DescribeDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:PassDataSet
+            - quicksight:DescribeIngestion
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DeleteDataSet
+            - quicksight:CreateIngestion
+            - quicksight:CancelIngestion
+            - quicksight:UpdateDataSetPermissions
+
+  # ---------------------------------------------------------------------------
+  # DataSet over tier_breakdown - daily users / messages / credits
+  # split by subscription tier and client. Powers the Economics sheet.
+  # ---------------------------------------------------------------------------
+  TierBreakdownDataSet:
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "${ResourcePrefix}-tier-breakdown"
+      Name: Kiro - Tier Breakdown
+      ImportMode: SPICE
+      PhysicalTableMap:
+        base:
+          RelationalTable:
+            DataSourceArn: !GetAtt AthenaDataSource.Arn
+            Catalog: AwsDataCatalog
+            Schema: !Ref GlueDatabase
+            Name: tier_breakdown
+            InputColumns:
+              - { Name: activity_date,        Type: DATETIME }
+              - { Name: subscription_tier,    Type: STRING }
+              - { Name: client_type,          Type: STRING }
+              - { Name: users,                Type: INTEGER }
+              - { Name: messages,             Type: INTEGER }
+              - { Name: credits_used,         Type: DECIMAL }
+              - { Name: overage_credits_used, Type: DECIMAL }
+              - { Name: base_credits_used,    Type: DECIMAL }
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - quicksight:DescribeDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:PassDataSet
+            - quicksight:DescribeIngestion
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DeleteDataSet
+            - quicksight:CreateIngestion
+            - quicksight:CancelIngestion
+            - quicksight:UpdateDataSetPermissions
+
+  # ---------------------------------------------------------------------------
+  # DataSet over engagement_segmentation - 30-day per-user segment
+  # (New / Active / Power). Powers the engagement donut.
+  # ---------------------------------------------------------------------------
+  EngagementDataSet:
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "${ResourcePrefix}-engagement"
+      Name: Kiro - Engagement
+      ImportMode: SPICE
+      PhysicalTableMap:
+        base:
+          RelationalTable:
+            DataSourceArn: !GetAtt AthenaDataSource.Arn
+            Catalog: AwsDataCatalog
+            Schema: !Ref GlueDatabase
+            Name: engagement_segmentation
+            InputColumns:
+              - { Name: user_id,           Type: STRING }
+              - { Name: user_label,        Type: STRING }
+              - { Name: subscription_tier, Type: STRING }
+              - { Name: active_days_30d,   Type: INTEGER }
+              - { Name: messages_30d,      Type: INTEGER }
+              - { Name: is_active,         Type: INTEGER }
+              - { Name: segment,           Type: STRING }
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - quicksight:DescribeDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:PassDataSet
+            - quicksight:DescribeIngestion
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DeleteDataSet
+            - quicksight:CreateIngestion
+            - quicksight:CancelIngestion
+            - quicksight:UpdateDataSetPermissions
+
+  # ---------------------------------------------------------------------------
+  # DataSet over model_usage - daily per-user-per-model message
+  # counts. Drives the model picker and stacked-area visuals.
+  # ---------------------------------------------------------------------------
+  ModelUsageDataSet:
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "${ResourcePrefix}-model-usage"
+      Name: Kiro - Model Usage
+      ImportMode: SPICE
+      PhysicalTableMap:
+        base:
+          RelationalTable:
+            DataSourceArn: !GetAtt AthenaDataSource.Arn
+            Catalog: AwsDataCatalog
+            Schema: !Ref GlueDatabase
+            Name: model_usage
+            InputColumns:
+              - { Name: activity_date,     Type: DATETIME }
+              - { Name: user_id,           Type: STRING }
+              - { Name: user_label,        Type: STRING }
+              - { Name: client_type,       Type: STRING }
+              - { Name: subscription_tier, Type: STRING }
+              - { Name: model_name,        Type: STRING }
+              - { Name: messages,          Type: INTEGER }
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - quicksight:DescribeDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:PassDataSet
+            - quicksight:DescribeIngestion
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DeleteDataSet
+            - quicksight:CreateIngestion
+            - quicksight:CancelIngestion
+            - quicksight:UpdateDataSetPermissions
+
+  # ---------------------------------------------------------------------------
+  # DataSet over wow_movers - week-over-week message deltas with an
+  # at-risk flag. Powers the People sheet movers table.
+  # ---------------------------------------------------------------------------
+  WowMoversDataSet:
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "${ResourcePrefix}-wow-movers"
+      Name: Kiro - Week-over-Week Movers
+      ImportMode: SPICE
+      PhysicalTableMap:
+        base:
+          RelationalTable:
+            DataSourceArn: !GetAtt AthenaDataSource.Arn
+            Catalog: AwsDataCatalog
+            Schema: !Ref GlueDatabase
+            Name: wow_movers
+            InputColumns:
+              - { Name: user_id,           Type: STRING }
+              - { Name: user_label,        Type: STRING }
+              - { Name: subscription_tier, Type: STRING }
+              - { Name: prior_messages,    Type: INTEGER }
+              - { Name: recent_messages,   Type: INTEGER }
+              - { Name: message_delta,     Type: INTEGER }
+              - { Name: abs_delta,         Type: INTEGER }
+              - { Name: pct_change,        Type: DECIMAL }
+              - { Name: at_risk,           Type: STRING }
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - quicksight:DescribeDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:PassDataSet
+            - quicksight:DescribeIngestion
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DeleteDataSet
+            - quicksight:CreateIngestion
+            - quicksight:CancelIngestion
+            - quicksight:UpdateDataSetPermissions
+
+  # ---------------------------------------------------------------------------
+  # DataSet over period_comparison - current vs prior 30d totals by
+  # tier. Powers the Executive sheet comparison table.
+  # ---------------------------------------------------------------------------
+  PeriodComparisonDataSet:
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "${ResourcePrefix}-period-comparison"
+      Name: Kiro - Period Comparison (current vs prior 30d)
+      ImportMode: SPICE
+      PhysicalTableMap:
+        base:
+          RelationalTable:
+            DataSourceArn: !GetAtt AthenaDataSource.Arn
+            Catalog: AwsDataCatalog
+            Schema: !Ref GlueDatabase
+            Name: period_comparison
+            InputColumns:
+              - { Name: period,            Type: STRING }
+              - { Name: sort_key,          Type: INTEGER }
+              - { Name: subscription_tier, Type: STRING }
+              - { Name: messages,          Type: INTEGER }
+              - { Name: credits_used,      Type: DECIMAL }
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - quicksight:DescribeDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:PassDataSet
+            - quicksight:DescribeIngestion
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DeleteDataSet
+            - quicksight:CreateIngestion
+            - quicksight:CancelIngestion
+            - quicksight:UpdateDataSetPermissions
+
+  # ---------------------------------------------------------------------------
+  # DataSet over cohort_retention - weekly cohort retention curve.
+  # Powers the People sheet retention chart.
+  # ---------------------------------------------------------------------------
+  CohortRetentionDataSet:
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "${ResourcePrefix}-cohort-retention"
+      Name: Kiro - Cohort Retention
+      ImportMode: SPICE
+      PhysicalTableMap:
+        base:
+          RelationalTable:
+            DataSourceArn: !GetAtt AthenaDataSource.Arn
+            Catalog: AwsDataCatalog
+            Schema: !Ref GlueDatabase
+            Name: cohort_retention
+            InputColumns:
+              - { Name: cohort_month,      Type: DATETIME }
+              - { Name: months_since,      Type: INTEGER }
+              - { Name: subscription_tier, Type: STRING }
+              - { Name: active_users,      Type: INTEGER }
+              - { Name: cohort_size,       Type: INTEGER }
+              - { Name: retention_rate,    Type: DECIMAL }
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - quicksight:DescribeDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:PassDataSet
+            - quicksight:DescribeIngestion
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DeleteDataSet
+            - quicksight:CreateIngestion
+            - quicksight:CancelIngestion
+            - quicksight:UpdateDataSetPermissions
+
+  # NOTE: the engagement_funnel dataset was removed. The People-sheet funnel was
+  # reworked from a native funnel chart (reading this SPICE dataset) into three
+  # date-range-driven KPI tiles computed from base-user-activity via calculated
+  # fields in scripts/create_dashboard.py, so this dataset is no longer used.
+
+  # ---------------------------------------------------------------------------
+  # DataSet over activity_heatmap - daily user / message / credit
+  # totals by tier. Powers the Activity & Trends area chart.
+  # ---------------------------------------------------------------------------
+  ActivityHeatmapDataSet:
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "${ResourcePrefix}-activity-heatmap"
+      Name: Kiro - Activity Heatmap
+      ImportMode: SPICE
+      PhysicalTableMap:
+        base:
+          RelationalTable:
+            DataSourceArn: !GetAtt AthenaDataSource.Arn
+            Catalog: AwsDataCatalog
+            Schema: !Ref GlueDatabase
+            Name: activity_heatmap
+            InputColumns:
+              - { Name: activity_date,     Type: DATETIME }
+              - { Name: subscription_tier, Type: STRING }
+              - { Name: active_users,      Type: INTEGER }
+              - { Name: messages,          Type: INTEGER }
+              - { Name: credits_used,      Type: DECIMAL }
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - quicksight:DescribeDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:PassDataSet
+            - quicksight:DescribeIngestion
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DeleteDataSet
+            - quicksight:CreateIngestion
+            - quicksight:CancelIngestion
+            - quicksight:UpdateDataSetPermissions
+
+  # ---------------------------------------------------------------------------
+  # Daily SPICE refresh schedules. All run at ~04:00 UTC, an hour
+  # after the AWS Glue crawler (which runs an hour after Kiro's 02:00
+  # UTC export). Schedules are staggered by 5 minutes so a single
+  # Athena spike doesn't hit the workgroup all at once.
+  # ---------------------------------------------------------------------------
+  BaseRefreshSchedule:
+    Type: AWS::QuickSight::RefreshSchedule
+    DependsOn: BaseUserActivityDataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "${ResourcePrefix}-base-user-activity"
+      Schedule:
+        ScheduleId: daily
+        RefreshType: FULL_REFRESH
+        ScheduleFrequency: { Interval: DAILY, TimeOfTheDay: "04:00" }
+
+  # ---------------------------------------------------------------------------
+  # Daily refresh - daily_trends.
+  # ---------------------------------------------------------------------------
+  TrendsRefreshSchedule:
+    Type: AWS::QuickSight::RefreshSchedule
+    DependsOn: DailyTrendsDataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "${ResourcePrefix}-daily-trends"
+      Schedule:
+        ScheduleId: daily
+        RefreshType: FULL_REFRESH
+        ScheduleFrequency: { Interval: DAILY, TimeOfTheDay: "04:05" }
+
+  # ---------------------------------------------------------------------------
+  # Daily refresh - user_totals.
+  # ---------------------------------------------------------------------------
+  UsersRefreshSchedule:
+    Type: AWS::QuickSight::RefreshSchedule
+    DependsOn: UserTotalsDataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "${ResourcePrefix}-user-totals"
+      Schedule:
+        ScheduleId: daily
+        RefreshType: FULL_REFRESH
+        ScheduleFrequency: { Interval: DAILY, TimeOfTheDay: "04:10" }
+
+  # ---------------------------------------------------------------------------
+  # Daily refresh - tier_breakdown.
+  # ---------------------------------------------------------------------------
+  TiersRefreshSchedule:
+    Type: AWS::QuickSight::RefreshSchedule
+    DependsOn: TierBreakdownDataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "${ResourcePrefix}-tier-breakdown"
+      Schedule:
+        ScheduleId: daily
+        RefreshType: FULL_REFRESH
+        ScheduleFrequency: { Interval: DAILY, TimeOfTheDay: "04:15" }
+
+  # ---------------------------------------------------------------------------
+  # Daily refresh - engagement_segmentation.
+  # ---------------------------------------------------------------------------
+  EngagementRefreshSchedule:
+    Type: AWS::QuickSight::RefreshSchedule
+    DependsOn: EngagementDataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "${ResourcePrefix}-engagement"
+      Schedule:
+        ScheduleId: daily
+        RefreshType: FULL_REFRESH
+        ScheduleFrequency: { Interval: DAILY, TimeOfTheDay: "04:20" }
+
+  # ---------------------------------------------------------------------------
+  # Daily refresh - model_usage.
+  # ---------------------------------------------------------------------------
+  ModelUsageRefreshSchedule:
+    Type: AWS::QuickSight::RefreshSchedule
+    DependsOn: ModelUsageDataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "${ResourcePrefix}-model-usage"
+      Schedule:
+        ScheduleId: daily
+        RefreshType: FULL_REFRESH
+        ScheduleFrequency: { Interval: DAILY, TimeOfTheDay: "04:25" }
+
+  # ---------------------------------------------------------------------------
+  # Daily refresh - activity_heatmap.
+  # ---------------------------------------------------------------------------
+  HeatmapRefreshSchedule:
+    Type: AWS::QuickSight::RefreshSchedule
+    DependsOn: ActivityHeatmapDataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "${ResourcePrefix}-activity-heatmap"
+      Schedule:
+        ScheduleId: daily
+        RefreshType: FULL_REFRESH
+        ScheduleFrequency: { Interval: DAILY, TimeOfTheDay: "04:35" }
+
+  # ---------------------------------------------------------------------------
+  # Daily refresh - period_comparison.
+  # ---------------------------------------------------------------------------
+  PeriodComparisonRefreshSchedule:
+    Type: AWS::QuickSight::RefreshSchedule
+    DependsOn: PeriodComparisonDataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "${ResourcePrefix}-period-comparison"
+      Schedule:
+        ScheduleId: daily
+        RefreshType: FULL_REFRESH
+        ScheduleFrequency: { Interval: DAILY, TimeOfTheDay: "05:00" }
+
+  # ---------------------------------------------------------------------------
+  # Daily refresh - cohort_retention.
+  # ---------------------------------------------------------------------------
+  CohortRefreshSchedule:
+    Type: AWS::QuickSight::RefreshSchedule
+    DependsOn: CohortRetentionDataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "${ResourcePrefix}-cohort-retention"
+      Schedule:
+        ScheduleId: daily
+        RefreshType: FULL_REFRESH
+        ScheduleFrequency: { Interval: DAILY, TimeOfTheDay: "04:55" }
+
+  # (engagement_funnel refresh schedule removed alongside its dataset - the
+  # People funnel is now KPI tiles over base-user-activity.)
+
+  # ---------------------------------------------------------------------------
+  # Daily refresh - wow_movers.
+  # ---------------------------------------------------------------------------
+  MoversRefreshSchedule:
+    Type: AWS::QuickSight::RefreshSchedule
+    DependsOn: WowMoversDataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "${ResourcePrefix}-wow-movers"
+      Schedule:
+        ScheduleId: daily
+        RefreshType: FULL_REFRESH
+        ScheduleFrequency: { Interval: DAILY, TimeOfTheDay: "04:50" }
+
+Outputs:
+  DataSourceArn:
+    Value: !GetAtt AthenaDataSource.Arn
+  ThemeArn:
+    Value: !GetAtt KiroTheme.Arn
+  BaseUserActivityDataSetArn: { Value: !GetAtt BaseUserActivityDataSet.Arn }
+  DailyTrendsDataSetArn:      { Value: !GetAtt DailyTrendsDataSet.Arn }
+  UserTotalsDataSetArn:       { Value: !GetAtt UserTotalsDataSet.Arn }
+  TierBreakdownDataSetArn:    { Value: !GetAtt TierBreakdownDataSet.Arn }
+  EngagementDataSetArn:       { Value: !GetAtt EngagementDataSet.Arn }
+  ModelUsageDataSetArn:       { Value: !GetAtt ModelUsageDataSet.Arn }
+  WowMoversDataSetArn:        { Value: !GetAtt WowMoversDataSet.Arn }
+  ActivityHeatmapDataSetArn:  { Value: !GetAtt ActivityHeatmapDataSet.Arn }
+  CohortRetentionDataSetArn:  { Value: !GetAtt CohortRetentionDataSet.Arn }
+  PeriodComparisonDataSetArn: { Value: !GetAtt PeriodComparisonDataSet.Arn }

@@ -1,0 +1,352 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Kiro User Analytics - Data layer (AWS Glue + Athena).
+  Crawls the Kiro User Activity Report exported by Kiro to a customer-owned
+  S3 bucket, registers it as a AWS Glue table, and creates an Athena workgroup
+  with a dedicated results bucket.
+
+Parameters:
+  KiroLogsBucketName:
+    Type: String
+    Description: >
+      Name of the existing S3 bucket where Kiro writes the User Activity
+      Report. The bucket policy must already grant the Kiro export service
+      principal s3:PutObject - configured by a Kiro administrator when the
+      export is enabled. See the Kiro user activity report documentation
+      linked from the README for setup steps.
+
+  KiroLogsPrefix:
+    Type: String
+    Default: ""
+    Description: >
+      Optional prefix inside the bucket BEFORE the "AWSLogs/<accountId>/KiroLogs/"
+      path. Leave blank if Kiro writes to the bucket root. No leading slash;
+      include a trailing slash if non-empty (e.g. "kiro/").
+
+  DatabaseName:
+    Type: String
+    Default: kiro_analytics
+    AllowedPattern: "[a-z][a-z0-9_]{0,62}"
+    Description: AWS Glue database name. Lower-case, underscores only.
+
+  WorkgroupName:
+    Type: String
+    Default: kiro_analytics
+
+  CrawlerSchedule:
+    Type: String
+    Default: "cron(0 3 * * ? *)"
+    Description: >
+      Cron schedule for the AWS Glue crawlers (UTC). Default 03:00 UTC, one hour
+      after the Kiro export at 02:00 UTC.
+
+  KmsKeyArn:
+    Type: String
+    Default: ""
+    Description: >
+      Optional KMS key ARN that encrypts the Kiro logs bucket. When set, the
+      crawler role is granted kms:Decrypt on this key. Leave blank for
+      SSE-S3-only buckets (no extra grant needed).
+
+Conditions:
+  HasKmsKey: !Not [!Equals [!Ref KmsKeyArn, ""]]
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # Athena results bucket - separate from the Kiro logs bucket so Athena writes
+  # do not mingle with raw exports. Public access blocked, SSE-S3 encrypted,
+  # versioned, 30-day result retention, with a TLS-only bucket policy.
+  # Server access logging is intentionally not configured: enabling it would
+  # add a second bucket + bucket policy + teardown step to every customer
+  # deployment for an audit trail most do not need (CloudTrail covers the
+  # Athena query API events at the account level). Customers who require
+  # S3 access logging can enable it on this bucket post-deploy.
+  # ---------------------------------------------------------------------------
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: "Server access logging is opt-in for the customer; CloudTrail covers Athena API events at the account level."
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: "Server access logging is opt-in for the customer; see resource comment."
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-athena-results-${AWS::AccountId}-${AWS::Region}"
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireQueryResults
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpirationInDays: 7
+
+  # ---------------------------------------------------------------------------
+  # Bucket policy on the Athena results bucket - deny all non-TLS access.
+  # ---------------------------------------------------------------------------
+  AthenaResultsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AthenaResultsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt AthenaResultsBucket.Arn
+              - !Sub "${AthenaResultsBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ---------------------------------------------------------------------------
+  # AWS Glue database. Note on encryption-at-rest: AWS Glue catalog encryption
+  # is an account+region-wide setting (AWS::Glue::DataCatalogEncryptionSettings),
+  # not a per-database property. We do not toggle it from this stack because
+  # doing so would affect every other AWS Glue database in the customer's
+  # account. Enable it once, account-wide, with:
+  #   aws glue put-data-catalog-encryption-settings \
+  #       --data-catalog-encryption-settings \
+  #       'EncryptionAtRest={CatalogEncryptionMode=SSE-KMS-WITH-SERVICE-MANAGED-KEY}'
+  # See README "Catalog encryption" section for guidance.
+  # ---------------------------------------------------------------------------
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref DatabaseName
+        Description: Kiro user activity analytics
+
+  # ---------------------------------------------------------------------------
+  # IAM role for the AWS Glue crawler. Trust policy restricts AssumeRole to
+  # the AWS Glue service principal. Permissions are granted via two scoped
+  # inline policies (no AWS-managed policy is attached - the typical
+  # AWSGlueServiceRole grants glue:* on all resources, which violates least
+  # privilege for a single-database crawler).
+  #
+  # The crawler needs:
+  #   1. Catalog: read+write on this specific database, its tables, and its
+  #      partitions only - so it can register the user_report table and
+  #      update its schema on each run.
+  #   2. Source data: read on the Kiro logs bucket so it can list keys and
+  #      sample CSV objects to infer schema.
+  #   3. Logging: write to /aws-glue/crawlers in CloudWatch Logs so AWS Glue
+  #      can publish per-run logs the customer can inspect when a crawl
+  #      fails.
+  #   4. Metrics: cloudwatch:PutMetricData (resource-scoped via Condition to
+  #      the AWS/Glue namespace) so the crawler can emit run metrics.
+  #   5. Optional KMS: kms:Decrypt on the customer-supplied KMS key, only
+  #      when KMS_KEY_ARN is set (the source bucket is SSE-KMS).
+  #
+  # Capabilities NOT granted that AWSGlueServiceRole would have allowed:
+  # glue:* on all resources, EC2 / VPC, IAM listing, ListAllMyBuckets,
+  # cross-bucket s3:* on aws-glue-*, ec2:*Tags. None apply to this crawler.
+  # ---------------------------------------------------------------------------
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: glue.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GlueCatalogRW
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Catalog handle - the crawler needs to know the catalog exists
+              # before it can resolve the database under it. Catalog is a
+              # singleton per account/region; the resource ARN is fixed.
+              - Sid: CatalogHandle
+                Effect: Allow
+                Action: glue:GetCatalogImportStatus
+                Resource: !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+              # Database read+write scoped to OUR database. Crawlers update
+              # the database's last-access metadata even when they only
+              # touch tables, so UpdateDatabase is required.
+              - Sid: DatabaseScopedRW
+                Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:UpdateDatabase
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${DatabaseName}"
+              # Tables + partitions in OUR database. The crawler creates
+              # raw_user_report on first run and updates its schema +
+              # partitions on subsequent runs.
+              - Sid: TablesAndPartitionsScopedRW
+                Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:DeleteTable
+                  - glue:BatchDeleteTable
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:CreatePartition
+                  - glue:UpdatePartition
+                  - glue:DeletePartition
+                  - glue:BatchCreatePartition
+                  - glue:BatchGetPartition
+                  - glue:BatchUpdatePartition
+                  - glue:BatchDeletePartition
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${DatabaseName}"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${DatabaseName}/*"
+        - PolicyName: ReadKiroLogsBucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadSourceBucket
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${KiroLogsBucketName}"
+                  - !Sub "arn:${AWS::Partition}:s3:::${KiroLogsBucketName}/*"
+              - !If
+                - HasKmsKey
+                - Sid: DecryptSourceObjects
+                  Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                    - kms:DescribeKey
+                  Resource: !Ref KmsKeyArn
+                - !Ref AWS::NoValue
+        - PolicyName: CrawlerObservability
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # AWS Glue writes per-crawler logs under /aws-glue/crawlers.
+              # Scoped to that fixed prefix so the role cannot read or write
+              # arbitrary log groups.
+              - Sid: CrawlerLogsWrite
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*:log-stream:*"
+              # CloudWatch metrics from the crawler. PutMetricData has no
+              # resource-level ARN, so we constrain it via the
+              # cloudwatch:namespace condition to the AWS/Glue namespace
+              # AWS Glue actually emits to.
+              - Sid: PublishGlueMetrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: AWS/Glue
+
+  # ---------------------------------------------------------------------------
+  # Crawler for the modern user_report (KIRO_IDE / KIRO_CLI / PLUGIN)
+  # ---------------------------------------------------------------------------
+  UserReportCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "${AWS::StackName}-user-report"
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      TablePrefix: "raw_"
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${KiroLogsBucketName}/${KiroLogsPrefix}AWSLogs/${AWS::AccountId}/KiroLogs/user_report/"
+      Schedule:
+        ScheduleExpression: !Ref CrawlerSchedule
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      # TableLevelConfiguration:1 forces a single table at the prefix root.
+      # Without this, when Kiro adds a new <model>_messages column the crawler
+      # may decide the new files belong to a separate table (raw_user_report_<hash>),
+      # breaking build_views.py which hard-codes the table name.
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": { "AddOrUpdateBehavior": "InheritFromTable" },
+            "Tables":     { "AddOrUpdateBehavior": "MergeNewColumns" }
+          },
+          "Grouping": {
+            "TableGroupingPolicy": "CombineCompatibleSchemas",
+            "TableLevelConfiguration": 6
+          }
+        }
+
+  # ---------------------------------------------------------------------------
+  # Athena workgroup - dedicated so cost / query history is isolated.
+  # EnforceWorkGroupConfiguration prevents per-query overrides of the result
+  # location and encryption. PublishCloudWatchMetricsEnabled emits per-query
+  # metrics (DataScannedInBytes, EngineExecutionTime, etc.) to CloudWatch.
+  # The audit trail for query starts/stops is via the AWS::Athena
+  # StartQueryExecution / GetQueryExecution API events recorded in
+  # AWS CloudTrail (account-level data-event setting; see README).
+  # ---------------------------------------------------------------------------
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Ref WorkgroupName
+      State: ENABLED
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        RequesterPaysEnabled: false
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${AthenaResultsBucket}/query-results/"
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+
+Outputs:
+  GlueDatabaseName:
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub "${AWS::StackName}-GlueDatabaseName"
+  AthenaWorkgroupName:
+    Value: !Ref AthenaWorkgroup
+    Export:
+      Name: !Sub "${AWS::StackName}-AthenaWorkgroup"
+  AthenaResultsBucket:
+    Value: !Ref AthenaResultsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-AthenaResultsBucket"
+  UserReportCrawlerName:
+    Value: !Ref UserReportCrawler
+  KiroLogsBucketName:
+    Value: !Ref KiroLogsBucketName
+    Export:
+      Name: !Sub "${AWS::StackName}-KiroLogsBucket"

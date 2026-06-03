@@ -1,0 +1,450 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Kiro User Analytics - OPTIONAL Identity Center user mapping.
+  Resolves the opaque user_id GUIDs in the Kiro User Activity Report to human
+  identities (display name / username / email) via AWS IAM Identity Center, and
+  lands the result as a CSV the Athena identity_map view reads. Deployed only
+  when identity mapping is enabled in deploy.sh; never created otherwise.
+  COMPLIANCE NOTE: this solution processes personal data (names, emails). If you
+  handle EU user data, ensure GDPR compliance including a lawful basis for
+  processing, user consent where required, and appropriate data-retention
+  policies. Customers are responsible for compliance with applicable data
+  protection regulations. See SECURITY.md "Identity mapping (optional)".
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: kiro-analytics
+    Description: Prefix shared with the data / QuickSight stacks.
+
+  IdentityStoreId:
+    Type: String
+    AllowedPattern: "d-[0-9a-zA-Z]{10}"
+    Description: >
+      The IAM Identity Center *Identity Store* id (starts with d-), NOT the
+      instance ARN. Found on the Identity Center Settings page or via
+      `aws sso-admin list-instances --query 'Instances[].IdentityStoreId'`.
+
+  IdcRegion:
+    Type: String
+    Description: Region where IAM Identity Center lives (may differ from the data region).
+
+  IdcRoleArn:
+    Type: String
+    Default: ""
+    Description: >
+      Optional. ARN of a role to assume for cross-account Identity Center
+      (when the directory lives in the org management / delegated-admin
+      account). Leave blank for same-account Identity Center.
+
+  SourceKmsKeyArn:
+    Type: String
+    Default: ""
+    Description: >
+      Optional. KMS key ARN the Kiro logs bucket is encrypted with (the same
+      KMS_KEY_ARN passed to the data stack). When set, the Lambda gets
+      kms:Decrypt on it so its Athena query can read the source data. Leave
+      blank for SSE-S3 source buckets.
+
+  AthenaDatabase:
+    Type: String
+    AllowedPattern: "[a-z][a-z0-9_]{0,62}"
+    Description: Glue database holding base_user_activity (from the data stack).
+
+  AthenaWorkgroup:
+    Type: String
+    Description: Athena workgroup to run the distinct-user query in (from the data stack).
+
+  AthenaResultsBucket:
+    Type: String
+    Description: >
+      The data stack's Athena results bucket. Used (a) as the Athena query
+      output location for the Lambda's distinct-user query, and (b) to stage
+      the Lambda deployment zip. NOT where the identity-map PII CSV is written
+      (that goes to the dedicated IdentityMapBucket below).
+
+  KiroLogsBucket:
+    Type: String
+    Description: >
+      The bucket holding the Kiro User Activity Report (source data). The
+      Lambda's SELECT DISTINCT userid FROM raw_user_report reads objects here
+      via Athena, so the execution role needs read access to it.
+
+  LambdaCodeS3Key:
+    Type: String
+    Description: S3 key of the Lambda deployment zip staged in AthenaResultsBucket by deploy.sh.
+
+  RefreshSchedule:
+    Type: String
+    Default: "cron(30 3 * * ? *)"
+    Description: >
+      Daily refresh schedule (UTC). Default 03:30 - after the 03:00 Glue
+      crawler, before the 04:00 SPICE refresh, so the map is fresh for each
+      day's ingest.
+
+Conditions:
+  HasIdcRole: !Not [!Equals [!Ref IdcRoleArn, ""]]
+  HasSourceKmsKey: !Not [!Equals [!Ref SourceKmsKeyArn, ""]]
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # KMS key for the identity-map bucket. This bucket holds real names + emails
+  # (PII) resolved from the directory, so - unlike the Athena results bucket
+  # (transient query scratch, SSE-S3) - it gets a dedicated CMK, access
+  # logging, and TLS-only enforcement.
+  # ---------------------------------------------------------------------------
+  IdentityMapKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub "Encrypts the Kiro identity-map PII bucket (${ResourcePrefix})"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          # Root statement delegates access control to IAM, so the Lambda
+          # role's scoped kms:Encrypt/GenerateDataKey policy is sufficient.
+          # (An explicit key-policy grant to the role ARN here would create a
+          # KMS-key <-> role circular dependency at stack-create time.)
+          - Sid: AccountRoot
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root" }
+            Action: "kms:*"
+            Resource: "*"
+
+  IdentityMapKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ResourcePrefix}-identity-map"
+      TargetKeyId: !Ref IdentityMapKey
+
+  # ---------------------------------------------------------------------------
+  # Access-log bucket for the identity-map bucket. Server access logging IS
+  # configured here (unlike the results bucket) because the identity-map bucket
+  # holds PII. This log bucket itself can't log to itself, so its own W35 /
+  # CKV_AWS_18 are suppressed with that reason.
+  # ---------------------------------------------------------------------------
+  IdentityMapLogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: "This is itself the access-log destination bucket; it cannot log to itself."
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: "Access-log destination bucket; cannot log to itself."
+    Properties:
+      BucketName: !Sub "${ResourcePrefix}-idmap-logs-${AWS::AccountId}-${AWS::Region}"
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireLogs
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 90
+
+  # ---------------------------------------------------------------------------
+  # Dedicated PII bucket for the identity-map CSV. KMS-encrypted, access
+  # logging on, versioned, TLS-only (policy below), 90-day lifecycle. Read is
+  # scoped (via the QuickSight S3 grant the deploy script writes) to the QS
+  # service role; the Lambda writes it.
+  # ---------------------------------------------------------------------------
+  IdentityMapBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ResourcePrefix}-identity-map-${AWS::AccountId}-${AWS::Region}"
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref IdentityMapKey
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref IdentityMapLogBucket
+        LogFilePrefix: access-logs/
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireIdentityMap
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+
+  IdentityMapBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref IdentityMapBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt IdentityMapBucket.Arn
+              - !Sub "${IdentityMapBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # TLS-only on the access-log bucket too, plus the grant the S3 logging
+  # service needs to deliver logs here (BucketOwnerEnforced disables ACLs, so
+  # logging.s3.amazonaws.com writes via this bucket-policy statement instead).
+  IdentityMapLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref IdentityMapLogBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt IdentityMapLogBucket.Arn
+              - !Sub "${IdentityMapLogBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+          - Sid: AllowS3ServerAccessLogsDelivery
+            Effect: Allow
+            Principal: { Service: logging.s3.amazonaws.com }
+            Action: "s3:PutObject"
+            Resource: !Sub "${IdentityMapLogBucket.Arn}/access-logs/*"
+            Condition:
+              ArnLike:
+                aws:SourceArn: !GetAtt IdentityMapBucket.Arn
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # ---------------------------------------------------------------------------
+  # Lambda execution role - least privilege:
+  #   * identitystore:ListUsers on the specific Identity Store only
+  #   * sts:AssumeRole on the cross-account role, only when one is supplied
+  #   * Athena: run the distinct-user query in the workgroup
+  #   * Glue: read the table the query touches
+  #   * S3: read source data (results bucket scratch + Kiro logs via Athena),
+  #     write the PII CSV to the identity-map bucket, read its own code zip
+  #   * KMS: encrypt with the identity-map CMK
+  #   * Logs: its own log group
+  # ---------------------------------------------------------------------------
+  IdentityMapLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: IdentityStoreRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # ListUsers requires two resource types: the Identitystore
+              # (account-qualified ARN) and AllUsers (arn .../user/* with an
+              # EMPTY account field - per the IAM service-authorization ref).
+              # NOTE: this same-account grant only applies when Identity Center
+              # is in THIS account. For cross-account IdC the Lambda assumes
+              # IdcRoleArn and uses THAT role's permissions instead, so this
+              # statement is simply unused (the account id won't match).
+              - Sid: ListUsersOnStore
+                Effect: Allow
+                Action: identitystore:ListUsers
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:identitystore::${AWS::AccountId}:identitystore/${IdentityStoreId}"
+                  - !Sub "arn:${AWS::Partition}:identitystore:::user/*"
+        - !If
+          - HasIdcRole
+          - PolicyName: AssumeIdcRole
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Sid: AssumeCrossAccountIdcRole
+                  Effect: Allow
+                  Action: sts:AssumeRole
+                  Resource: !Ref IdcRoleArn
+          - !Ref AWS::NoValue
+        - PolicyName: AthenaQuery
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: RunDistinctUserQuery
+                Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:StopQueryExecution
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AthenaWorkgroup}"
+              - Sid: GlueReadForQuery
+                Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetDatabase
+                  - glue:GetPartitions
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${AthenaDatabase}"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${AthenaDatabase}/*"
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Write Athena query scratch (the distinct-user query lands its
+              # output under the workgroup's results location) + read the
+              # Lambda's own deployment zip staged here by deploy.sh.
+              - Sid: ResultsBucketRW
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${AthenaResultsBucket}"
+                  - !Sub "arn:${AWS::Partition}:s3:::${AthenaResultsBucket}/*"
+              # Read the Kiro source data the distinct-user Athena query scans.
+              - Sid: KiroLogsRead
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${KiroLogsBucket}"
+                  - !Sub "arn:${AWS::Partition}:s3:::${KiroLogsBucket}/*"
+              # Write the identity-map PII CSV.
+              - Sid: IdentityMapWrite
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt IdentityMapBucket.Arn
+                  - !Sub "${IdentityMapBucket.Arn}/*"
+        - PolicyName: KmsForIdentityMap
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EncryptIdentityMap
+                Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt IdentityMapKey.Arn
+        - !If
+          - HasSourceKmsKey
+          - PolicyName: DecryptSourceData
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Sid: DecryptKiroLogs
+                  Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref SourceKmsKeyArn
+          - !Ref AWS::NoValue
+        - PolicyName: OwnLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: LambdaLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ResourcePrefix}-identity-map*"
+
+  IdentityMapLambda:
+    Type: AWS::Lambda::Function
+    # checkov:skip=CKV_AWS_117: Not in a VPC - it calls only public AWS APIs (Identity Store, Athena, S3, KMS); a VPC would add NAT cost with no security gain.
+    # checkov:skip=CKV_AWS_116: No DLQ - the daily schedule retries next day and the function fails closed (leaves the prior map); a DLQ adds ops surface without benefit for an idempotent daily refresh.
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-identity-map"
+      Runtime: python3.12
+      Handler: identity_map_lambda.handler
+      Timeout: 600
+      MemorySize: 256
+      ReservedConcurrentExecutions: 1
+      Role: !GetAtt IdentityMapLambdaRole.Arn
+      Code:
+        S3Bucket: !Ref AthenaResultsBucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          IDENTITY_STORE_ID: !Ref IdentityStoreId
+          IDC_REGION: !Ref IdcRegion
+          IDC_ROLE_ARN: !Ref IdcRoleArn
+          ATHENA_DATABASE: !Ref AthenaDatabase
+          ATHENA_WORKGROUP: !Ref AthenaWorkgroup
+          ATHENA_REGION: !Ref AWS::Region
+          MAP_BUCKET: !Ref IdentityMapBucket
+          MAP_KEY: identity-map/users.csv
+
+  # ---------------------------------------------------------------------------
+  # Daily refresh schedule. Runs the Lambda at 03:30 UTC by default - after the
+  # 03:00 crawler, before the 04:00 SPICE refresh.
+  # ---------------------------------------------------------------------------
+  RefreshRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ResourcePrefix}-identity-map-daily"
+      ScheduleExpression: !Ref RefreshSchedule
+      State: ENABLED
+      Targets:
+        - Id: IdentityMapLambda
+          Arn: !GetAtt IdentityMapLambda.Arn
+
+  RefreshRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IdentityMapLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RefreshRule.Arn
+
+Outputs:
+  IdentityMapBucketName:
+    Value: !Ref IdentityMapBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-IdentityMapBucket"
+  IdentityMapLambdaName:
+    Value: !Ref IdentityMapLambda
+  IdentityMapKeyArn:
+    Value: !GetAtt IdentityMapKey.Arn

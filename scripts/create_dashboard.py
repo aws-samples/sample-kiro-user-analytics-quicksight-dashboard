@@ -556,9 +556,10 @@ def _sub(visual: dict, subtitle: str) -> dict:
 
 def _kpi_sparkline(visual_id: str, title: str, dataset: str, value_col: str,
                    date_col: str, agg: str = "SUM"):
-    """KPI tile with a sparkline (TrendGroups) and a comparison value
-    (period-over-period). The comparison is computed by QS using a
-    SecondaryValue on the previous period.
+    """KPI tile showing the windowed total with a sparkline trend
+    (TrendGroups gives the sparkline its daily series). No period-over-period
+    comparison: see the KPIOptions note below for why the comparison/date
+    label is intentionally omitted.
     """
     return {
         "KPIVisual": {
@@ -583,9 +584,17 @@ def _kpi_sparkline(visual_id: str, title: str, dataset: str, value_col: str,
                     }],
                 },
                 "KPIOptions": {
+                    # KPI shows the windowed total + a sparkline trend only.
+                    # A KPI with a date TrendGroup auto-renders a "secondary
+                    # value" - the latest trend point's DATE (e.g. "Jun 2,
+                    # 2026") next to a period-over-period difference. That read
+                    # as "data ends June 2" and as a number that didn't match
+                    # the windowed total. SecondaryValue: HIDDEN suppresses that
+                    # date/difference while keeping the sparkline. (Omitting the
+                    # Comparison/TrendArrows blocks alone does NOT remove it -
+                    # the secondary value is on by default for a TrendGroup KPI.)
                     "Sparkline": {"Type": "LINE", "Visibility": "VISIBLE"},
-                    "TrendArrows": {"Visibility": "VISIBLE"},
-                    "Comparison": {"ComparisonMethod": "PERCENT_DIFFERENCE"},
+                    "SecondaryValue": {"Visibility": "HIDDEN"},
                     "PrimaryValueDisplayType": "ACTUAL",
                 },
             },
@@ -620,9 +629,17 @@ def _kpi_sparkline_calc(visual_id: str, title: str, dataset: str,
                     }],
                 },
                 "KPIOptions": {
+                    # KPI shows the windowed total + a sparkline trend only.
+                    # A KPI with a date TrendGroup auto-renders a "secondary
+                    # value" - the latest trend point's DATE (e.g. "Jun 2,
+                    # 2026") next to a period-over-period difference. That read
+                    # as "data ends June 2" and as a number that didn't match
+                    # the windowed total. SecondaryValue: HIDDEN suppresses that
+                    # date/difference while keeping the sparkline. (Omitting the
+                    # Comparison/TrendArrows blocks alone does NOT remove it -
+                    # the secondary value is on by default for a TrendGroup KPI.)
                     "Sparkline": {"Type": "LINE", "Visibility": "VISIBLE"},
-                    "TrendArrows": {"Visibility": "VISIBLE"},
-                    "Comparison": {"ComparisonMethod": "PERCENT_DIFFERENCE"},
+                    "SecondaryValue": {"Visibility": "HIDDEN"},
                     "PrimaryValueDisplayType": "ACTUAL",
                 },
             },
@@ -666,9 +683,17 @@ def _kpi_sparkline_distinct(visual_id: str, title: str, dataset: str,
                     }],
                 },
                 "KPIOptions": {
+                    # KPI shows the windowed total + a sparkline trend only.
+                    # A KPI with a date TrendGroup auto-renders a "secondary
+                    # value" - the latest trend point's DATE (e.g. "Jun 2,
+                    # 2026") next to a period-over-period difference. That read
+                    # as "data ends June 2" and as a number that didn't match
+                    # the windowed total. SecondaryValue: HIDDEN suppresses that
+                    # date/difference while keeping the sparkline. (Omitting the
+                    # Comparison/TrendArrows blocks alone does NOT remove it -
+                    # the secondary value is on by default for a TrendGroup KPI.)
                     "Sparkline": {"Type": "LINE", "Visibility": "VISIBLE"},
-                    "TrendArrows": {"Visibility": "VISIBLE"},
-                    "Comparison": {"ComparisonMethod": "PERCENT_DIFFERENCE"},
+                    "SecondaryValue": {"Visibility": "HIDDEN"},
                     "PrimaryValueDisplayType": "ACTUAL",
                 },
             },
@@ -988,14 +1013,17 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
              "Total provisioned users (the denominator behind Seat utilization). All-time roster - not affected by the date-range picker."),
     ]
     # Five KPI tiles across the 36-col grid (width 7 each: 0/7/14/21/28).
+    # KPI tiles are height 6 (not 4): the sparkline only renders when the tile
+    # has enough vertical room for title + value + the trend line. At height 4
+    # QuickSight drops the sparkline.
     exec_grid = [
-        ("xv-users",          0, 0,  7, 4),
-        ("xv-messages",       7, 0,  7, 4),
-        ("xv-credits",       14, 0,  7, 4),
-        ("xv-utilization",   21, 0,  7, 4),
-        ("xv-seats",         28, 0,  8, 4),
+        ("xv-users",          0, 0,  7, 6),
+        ("xv-messages",       7, 0,  7, 6),
+        ("xv-credits",       14, 0,  7, 6),
+        ("xv-utilization",   21, 0,  7, 6),
+        ("xv-seats",         28, 0,  8, 6),
     ]
-    next_row = 4
+    next_row = 6
 
     # Executive is a 30-second status page. KPI tiles cover the headline
     # "active users / messages / credits"; one trend line for the

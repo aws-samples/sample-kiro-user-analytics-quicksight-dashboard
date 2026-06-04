@@ -311,6 +311,8 @@ responsibility model.
 * **User identities are shown as opaque GUIDs** unless `IDENTITY_MAPPING=true` is set and the users sign in via AWS IAM Identity Center. Customer responsibility: decide whether resolving GUIDs to real names (which pulls personal data into SPICE, possibly across regions) is appropriate for the dashboard's audience. See [Resolving user identities](#resolving-user-identities-optional) and [SECURITY.md](./SECURITY.md#identity-mapping-optional).
 * Pre-April 2026 exports lack the `email` column and per-model `_messages` columns. The build script tolerates their absence; the affected visuals show user IDs or remain empty.
 * Multiple Amazon S3 exports for the same `(user_id, date)` are deduped by keeping the lexically-latest path.
+* **Tier and credits reflect observed *usage*, not the user's current subscription.** Every value (including `subscription_tier`) comes from the Kiro User Activity Report, which records what a user actually did each day. A user who is upgraded (e.g. Pro → Pro+) but has not used Kiro since the change will still appear under their **previous** tier and credit total until their next day of activity is exported. This is expected: the dashboard is a usage analytic, not a billing/entitlement view. For current subscription status, use Kiro's own admin/billing tools.
+* **KPI tiles show the total for the selected date range, with a sparkline trend** - they intentionally do not display a day-over-day comparison or a "latest date" label, which earlier read as the data being stale. To see day-by-day movement, use the Activity & Trends sheet or widen/narrow the date range.
 
 ## Encryption at rest
 

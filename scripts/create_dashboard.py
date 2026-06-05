@@ -801,11 +801,15 @@ def _bar_time_stacked(visual_id: str, title: str, dataset: str, date_col: str,
 
 def _bar_time_multi(visual_id: str, title: str, dataset: str, date_col: str,
                     value_cols: list[tuple[str, str]], arrangement: str = "STACKED",
-                    agg: str = "SUM"):
+                    agg: str = "SUM", legend_title: str | None = None):
     """Vertical bar over a daily date axis with multiple value series (one
     measure per (column, label) pair). Bar-chart replacement for _line_multi -
     e.g. new vs returning users, where the two series are separate columns and
-    STACKED gives the meaningful total (new + returning = daily active)."""
+    STACKED gives the meaningful total (new + returning = daily active).
+    `legend_title` overrides the legend heading: multi-series charts have no
+    color DIMENSION to name the legend, so QuickSight otherwise prints the
+    literal word "Legend" (unlike split-by-column charts that show e.g.
+    "Client Type")."""
     bar_config = {
         "BarsArrangement": arrangement,
         "Orientation": "VERTICAL",
@@ -831,6 +835,11 @@ def _bar_time_multi(visual_id: str, title: str, dataset: str, date_col: str,
             }],
         },
     }
+    if legend_title is not None:
+        bar_config["Legend"] = {
+            "Visibility": "VISIBLE",
+            "Title": {"Visibility": "VISIBLE", "CustomLabel": legend_title},
+        }
     return {
         "BarChartVisual": {
             "VisualId": visual_id,
@@ -1201,7 +1210,8 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
                 # total reads as that day's total active users.
                 _sub(_bar_time_multi("a-new-returning", "Daily new vs returning users", "trends",
                                  "activity_date",
-                                 [("new_users", "New"), ("returning_users", "Returning")]),
+                                 [("new_users", "New"), ("returning_users", "Returning")],
+                                 legend_title="User type"),
                      "Daily new (first-ever-seen) vs returning active users. A healthy adoption curve shows returning users growing while new users stay steady or rise."),
                 # 100%-stacked bar (STACKED_PERCENT): with 7+ models that grow
                 # over time, an absolute stacked bar is unreadable color-soup

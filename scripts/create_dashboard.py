@@ -70,6 +70,14 @@ _AUTO_NUMBER_FORMAT = {
 # emit: tier is normalized to Pro/Pro+/Power/Unknown (00_base_user_activity),
 # client_type is upper()'d (KIRO_IDE/KIRO_CLI/PLUGIN). A value not in the map
 # falls back to normal palette assignment, so new client types still render.
+# Kiro brand purple - the "primary/now/headline" convention. Used for Power
+# tier, the current-period comparison bar, and as the explicit fill for
+# single-series bars (which would otherwise inherit palette slot 1).
+_BRAND_PURPLE = "#9046FF"
+# Secondary/"prior/other" convention colour, paired with brand purple on
+# two-series charts (e.g. new vs returning, in-plan vs overage).
+_BRAND_ORANGE = "#FF8C00"
+
 # One hue, one meaning. Kiro purple #9046FF is reserved for Power tier ONLY
 # (and the "primary/now" UI convention) - it is deliberately NOT reused as a
 # client color or in the auto/model palette, so a viewer never sees the same
@@ -254,6 +262,18 @@ def _line_multi(visual_id: str, title: str, dataset: str, date_col: str,
     }
 
 
+def _bar_color(chart: dict, visual_id: str, dataset: str, category_col: str,
+               fieldwells_key: str = "BarChartAggregatedFieldWells") -> None:
+    """Give a single-measure bar chart a brand-purple fill instead of letting
+    it inherit palette slot 1 (now green). Pins the whole series to brand
+    purple (the 'primary' convention). We deliberately do NOT colour each bar
+    by its category: when the category is also the only dimension, QuickSight
+    rejects adding it to the Colors well too ("multiple dimension fields cannot
+    point to the same column"), and the category is already on the axis. Mutates
+    `chart` in place."""
+    chart["VisualPalette"] = {"ChartColor": _BRAND_PURPLE}
+
+
 def _bar(visual_id: str, title: str, dataset: str, category_col: str, value_col: str,
          items_limit: int | None = None):
     chart = {
@@ -281,6 +301,7 @@ def _bar(visual_id: str, title: str, dataset: str, category_col: str, value_col:
             }],
         },
     }
+    _bar_color(chart, visual_id, dataset, category_col)
     if items_limit:
         chart["SortConfiguration"]["CategoryItemsLimit"] = {
             "ItemsLimit": items_limit,
@@ -311,29 +332,31 @@ def _bar_calc(visual_id: str, title: str, dataset: str, category_col: str,
         "Column": {"DataSetIdentifier": dataset, "ColumnName": calc_field},
     }
     value_field.update(fmt)
+    chart = {
+        "FieldWells": {
+            "BarChartAggregatedFieldWells": {
+                "Category": [{
+                    "CategoricalDimensionField": {
+                        "FieldId": f"{visual_id}-c",
+                        "Column": {"DataSetIdentifier": dataset, "ColumnName": category_col},
+                    },
+                }],
+                "Values": [{"NumericalMeasureField": value_field}],
+            },
+        },
+        "Orientation": "HORIZONTAL",
+        "SortConfiguration": {
+            "CategorySort": [{
+                "FieldSort": {"FieldId": f"{visual_id}-v", "Direction": "DESC"},
+            }],
+        },
+    }
+    _bar_color(chart, visual_id, dataset, category_col)
     return {
         "BarChartVisual": {
             "VisualId": visual_id,
             "Title": {"Visibility": "VISIBLE", "FormatText": {"PlainText": title}},
-            "ChartConfiguration": {
-                "FieldWells": {
-                    "BarChartAggregatedFieldWells": {
-                        "Category": [{
-                            "CategoricalDimensionField": {
-                                "FieldId": f"{visual_id}-c",
-                                "Column": {"DataSetIdentifier": dataset, "ColumnName": category_col},
-                            },
-                        }],
-                        "Values": [{"NumericalMeasureField": value_field}],
-                    },
-                },
-                "Orientation": "HORIZONTAL",
-                "SortConfiguration": {
-                    "CategorySort": [{
-                        "FieldSort": {"FieldId": f"{visual_id}-v", "Direction": "DESC"},
-                    }],
-                },
-            },
+            "ChartConfiguration": chart,
         },
     }
 
@@ -797,6 +820,13 @@ def _bar_time_stacked(visual_id: str, title: str, dataset: str, date_col: str,
         cmap = _color_map(f"{visual_id}-c", stack_col)
         if cmap:
             bar_config["VisualPalette"] = {"ColorMap": cmap}
+    else:
+        # Single-series bar: there's no color dimension, so QuickSight would
+        # otherwise paint it with palette slot 1 (now green, since the auto
+        # palette was decoupled from the brand hues). Pin it to brand purple -
+        # the "primary" convention - so single-series time bars read as Kiro
+        # purple rather than whatever happens to lead the categorical palette.
+        bar_config["VisualPalette"] = {"ChartColor": _BRAND_PURPLE}
     return {
         "BarChartVisual": {
             "VisualId": visual_id,
@@ -808,7 +838,8 @@ def _bar_time_stacked(visual_id: str, title: str, dataset: str, date_col: str,
 
 def _bar_time_multi(visual_id: str, title: str, dataset: str, date_col: str,
                     value_cols: list[tuple[str, str]], arrangement: str = "STACKED",
-                    agg: str = "SUM", legend_title: str | None = None):
+                    agg: str = "SUM", legend_title: str | None = None,
+                    series_colors: list[str] | None = None):
     """Vertical bar over a daily date axis with multiple value series (one
     measure per (column, label) pair). Bar-chart replacement for _line_multi -
     e.g. new vs returning users, where the two series are separate columns and
@@ -846,6 +877,27 @@ def _bar_time_multi(visual_id: str, title: str, dataset: str, date_col: str,
         bar_config["Legend"] = {
             "Visibility": "VISIBLE",
             "Title": {"Visibility": "VISIBLE", "CustomLabel": legend_title},
+        }
+    if series_colors:
+        # Multi-MEASURE charts have no colour dimension, so a ColorMap can't
+        # target them - the segments are identified by their value FIELD.
+        # DataPathColor pins each measure's colour by field id + display value,
+        # keeping these off palette slot 1 (green) and onto the brand pair.
+        bar_config["VisualPalette"] = {
+            "ColorMap": [
+                {
+                    # FieldValue must be the COLUMN name (what QuickSight uses to
+                    # identify a measure series), NOT the display label - keying
+                    # on the label silently fails to match and the series falls
+                    # back to the auto palette.
+                    "Element": {
+                        "FieldId": f"{visual_id}-v{i}",
+                        "FieldValue": col,
+                    },
+                    "Color": color,
+                }
+                for i, ((col, label), color) in enumerate(zip(value_cols, series_colors))
+            ],
         }
     return {
         "BarChartVisual": {
@@ -1218,7 +1270,8 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
                 _sub(_bar_time_multi("a-new-returning", "Daily new vs returning users", "trends",
                                  "activity_date",
                                  [("new_users", "New"), ("returning_users", "Returning")],
-                                 legend_title="User type"),
+                                 legend_title="User type",
+                                 series_colors=[_BRAND_PURPLE, _BRAND_ORANGE]),
                      "Daily new (first-ever-seen) vs returning active users. A healthy adoption curve shows returning users growing while new users stay steady or rise."),
                 # 100%-stacked bar (STACKED_PERCENT): with 7+ models that grow
                 # over time, an absolute stacked bar is unreadable color-soup
@@ -1426,6 +1479,15 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
                                 },
                             },
                             "DataLabels": {"Visibility": "VISIBLE"},
+                            # Two measures (in-plan vs overage) - colour them as
+                            # the brand pair instead of palette slots 1/2 (green/
+                            # gold). Overage takes orange (the "watch this" hue).
+                            "VisualPalette": {
+                                "ColorMap": [
+                                    {"Element": {"FieldId": "e-credits-by-tier-base", "FieldValue": "base_credits_calc"}, "Color": _BRAND_PURPLE},
+                                    {"Element": {"FieldId": "e-credits-by-tier-over", "FieldValue": "overage_credits_used"}, "Color": _BRAND_ORANGE},
+                                ],
+                            },
                         },
                     },
                 }, "Credits per tier in the selected window, split into in-plan vs overage. A tall overage section = candidates for a tier upgrade."),

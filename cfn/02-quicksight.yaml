@@ -147,6 +147,7 @@ Resources:
               - { Name: user_label,            Type: STRING }
               - { Name: client_type,           Type: STRING }
               - { Name: subscription_tier,     Type: STRING }
+              - { Name: user_tier,             Type: STRING }
               - { Name: profile_id,            Type: STRING }
               - { Name: new_user,              Type: BOOLEAN }
               - { Name: chat_conversations,    Type: INTEGER }

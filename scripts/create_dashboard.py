@@ -742,6 +742,51 @@ def _area(visual_id: str, title: str, dataset: str, date_col: str, value_col: st
     }
 
 
+def _bar_time_stacked(visual_id: str, title: str, dataset: str, date_col: str,
+                      value_col: str, stack_col: str | None = None):
+    """Vertical stacked bar over a daily date axis, stacked by `stack_col`.
+    Drop-in replacement for _area(): sparse data reads as discrete bars per
+    day instead of a filled area that exaggerates a few scattered points."""
+    field_wells = {
+        "Category": [{
+            "DateDimensionField": {
+                "FieldId": f"{visual_id}-d",
+                "Column": {"DataSetIdentifier": dataset, "ColumnName": date_col},
+                "DateGranularity": "DAY",
+            },
+        }],
+        "Values": [{
+            "NumericalMeasureField": {
+                "FieldId": f"{visual_id}-v",
+                "Column": {"DataSetIdentifier": dataset, "ColumnName": value_col},
+                "AggregationFunction": {"SimpleNumericalAggregation": "SUM"},
+            },
+        }],
+    }
+    bar_config = {
+        "BarsArrangement": "STACKED",
+        "Orientation": "VERTICAL",
+        "FieldWells": {"BarChartAggregatedFieldWells": field_wells},
+    }
+    if stack_col:
+        field_wells["Colors"] = [{
+            "CategoricalDimensionField": {
+                "FieldId": f"{visual_id}-c",
+                "Column": {"DataSetIdentifier": dataset, "ColumnName": stack_col},
+            },
+        }]
+        cmap = _color_map(f"{visual_id}-c", stack_col)
+        if cmap:
+            bar_config["VisualPalette"] = {"ColorMap": cmap}
+    return {
+        "BarChartVisual": {
+            "VisualId": visual_id,
+            "Title": {"Visibility": "VISIBLE", "FormatText": {"PlainText": title}},
+            "ChartConfiguration": bar_config,
+        },
+    }
+
+
 def _donut(visual_id: str, title: str, dataset: str, category_col: str, count_col: str):
     return {
         "PieChartVisual": {
@@ -1075,11 +1120,11 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
                 _sub(_line("a-messages",    "Daily messages (by client)",     "tiers", "activity_date", "messages",      color_col="client_type"),
                      "Daily message volume by client. The mix shifts as users change which surfaces they prefer."),
                 # Single large stacked area for the headline cost story.
-                _sub(_area("a-credits",     "Daily credits used (by client)", "tiers", "activity_date", "credits_used", stack_col="client_type"),
+                _sub(_bar_time_stacked("a-credits",     "Daily credits used (by client)", "tiers", "activity_date", "credits_used", stack_col="client_type"),
                      "Daily credit consumption stacked by client - the cost story. Which surface drives most spend?"),
                 # Daily active users stacked by tier - replaces the earlier
                 # tier × day heatmap which read poorly with only 3 tiers.
-                _sub(_area("a-tier-trend", "Daily active users by tier", "heatmap", "activity_date", "active_users", stack_col="subscription_tier"),
+                _sub(_bar_time_stacked("a-tier-trend", "Daily active users by tier", "heatmap", "activity_date", "active_users", stack_col="subscription_tier"),
                      "Daily distinct users by tier (each counted once per day). POWER share rising = good adoption."),
                 # New vs returning active users per day - the adoption/onboarding
                 # signal. new_users / returning_users are separate columns on
@@ -1089,9 +1134,9 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
                                  "activity_date",
                                  [("new_users", "New"), ("returning_users", "Returning")]),
                      "Daily new (first-ever-seen) vs returning active users. A healthy adoption curve shows returning users growing while new users stay steady or rise."),
-                # One stacked area for model usage - replaces the bar+line pair.
-                _sub(_area("a-models",      "Daily messages by model",        "models", "activity_date", "messages", stack_col="model_name"),
-                     "Daily messages stacked by model. New models appear automatically; the relative band size shows adoption. Responds to both the date range and the Tier picker."),
+                # One stacked bar for model usage - replaces the bar+line pair.
+                _sub(_bar_time_stacked("a-models",      "Daily messages by model",        "models", "activity_date", "messages", stack_col="model_name"),
+                     "Daily messages stacked by model. New models appear automatically; the relative bar height shows adoption. Responds to both the date range and the Tier picker."),
             ],
             # Reading flow: who's using -> what they're sending -> what it costs.
             "Layouts": [{"Configuration": _grid([
@@ -1121,9 +1166,19 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
                 # to People for, so it leads the sheet. It's sortable by any
                 # column, which makes separate "top 10 by X" bars redundant -
                 # those were removed.
+                # Group by user_label + user_tier (NOT subscription_tier):
+                # subscription_tier is per-row in base, so a user who changed
+                # tier mid-window (e.g. Pro -> Pro+) would split into two rows.
+                # user_tier is a per-user CONSTANT (MAX over the window in the
+                # base view, so 'PRO_PLUS' > 'PRO' -> highest/most-recent tier
+                # wins) - grouping on it adds no extra rows, so each user is one
+                # row with usage metrics summed across whatever tier(s) they
+                # held in the selected range. A categorical MAX in the visual
+                # layer isn't possible (CategoricalMeasureField only allows
+                # DISTINCT_COUNT/COUNT), hence the data-layer constant column.
                 _sub(_table("p-all-users", "All users",
                            "base",
-                           dimensions=["user_label", "subscription_tier"],
+                           dimensions=["user_label", "user_tier"],
                            values=[
                                ("total_messages",       "SUM"),
                                ("chat_conversations",   "SUM"),
@@ -1132,7 +1187,7 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
                                ("active_days_calc",     None),
                            ],
                            sort_by=("credits_used", "DESC")),
-                     "Every user, sortable by any column. Scoped to the date range selected above - pick a month to see that period's per-user activity. Click any row to open that user on the User detail sheet."),
+                     "Every user (one row per user; usage summed across the period even if their tier changed), sortable by any column. Scoped to the date range selected above. Click any row to open that user on the User detail sheet."),
                 _sub(_pie_count("p-segments", "Engagement segments (selected range)", "base", "segment_calc", "user_id"),
                      "Active users in the selected date range split by intensity: Power (≥20 active days or ≥1000 messages) / Active (≥8 days) / Light (≥1 day). Recomputes as you change the date range above - pick a month to segment that period's users."),
                 # Engagement funnel rendered as three KPI tiles over the

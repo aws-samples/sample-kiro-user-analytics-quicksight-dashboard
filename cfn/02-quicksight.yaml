@@ -46,18 +46,32 @@ Resources:
       BaseThemeId: !If [IsDarkMode, MIDNIGHT, SEASIDE]
       Configuration:
         DataColorPalette:
-          # Same categorical palette in both modes - Kiro purple leads.
+          # Auto/categorical palette for dimensions that are NOT tier or client
+          # (e.g. message-mix by model). Deliberately DISJOINT from the pinned
+          # semantic hues - it contains no Kiro purple (#9046FF), AWS blue
+          # (#0972D3 / #4DA6FF), warm orange (#FF8C00), magenta (#E7157B) or
+          # teal (#00A4A6), because those each carry a fixed tier/client
+          # meaning. That stops a model segment from rendering in the exact
+          # colour that means "Power tier" or "KIRO_IDE" elsewhere on the sheet.
+          # 12 hues (was 8) with wide lightness spread for colourblind safety,
+          # which also pushes out the point where QuickSight recycles colours.
           Colors:
-            - "#9046FF"   # Kiro purple
-            - "#FF8C00"   # warm orange
-            - "#0972D3"   # AWS blue
-            - "#E7157B"   # magenta
-            - "#7AA116"   # olive
-            - "#F7C600"   # amber
-            - "#00A4A6"   # teal
-            - "#CD2264"   # crimson
+            - "#2CA02C"   # green
+            - "#B8860B"   # dark goldenrod
+            - "#6B4FA0"   # muted violet (distinct from brand purple - darker/desaturated)
+            - "#8C564B"   # brown
+            - "#BCBD22"   # olive-yellow
+            - "#4C9F70"   # sea green
+            - "#C77F00"   # burnt orange (darker than Warning/CLI orange)
+            - "#5B7DB1"   # slate blue (desaturated, distinct from AWS blue)
+            - "#9C6644"   # tan
+            - "#7F7F7F"   # medium grey
+            - "#1B9E77"   # teal-green
+            - "#E6AB02"   # mustard
           MinMaxGradient:
-            - !If [IsDarkMode, "#1A0033", "#F4ECFF"]
+            # Dark start lifted from #1A0033 (near-black, vanished into the
+            # MIDNIGHT canvas) to a visible dark purple.
+            - !If [IsDarkMode, "#2E1A4D", "#F4ECFF"]
             - "#9046FF"
           EmptyFillColor: !If [IsDarkMode, "#2B2B2B", "#F2F2F2"]
         UIColorPalette:
@@ -67,7 +81,10 @@ Resources:
           SecondaryForeground:  !If [IsDarkMode, "#E0E0E0", "#414D5C"]
           Accent:               "#9046FF"
           AccentForeground:     "#FFFFFF"
-          Danger:               !If [IsDarkMode, "#E7157B", "#D13212"]
+          # Dark danger was #E7157B - identical to the Pro+ tier colour, so
+          # "at-risk" and "Pro+" read as the same magenta in dark mode. Use a
+          # lightened pure red that isn't pinned to any tier/client/model.
+          Danger:               !If [IsDarkMode, "#FF5C5C", "#D13212"]
           DangerForeground:     "#FFFFFF"
           Warning:              "#FF8C00"
           WarningForeground:    "#FFFFFF"

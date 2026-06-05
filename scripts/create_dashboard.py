@@ -70,16 +70,23 @@ _AUTO_NUMBER_FORMAT = {
 # emit: tier is normalized to Pro/Pro+/Power/Unknown (00_base_user_activity),
 # client_type is upper()'d (KIRO_IDE/KIRO_CLI/PLUGIN). A value not in the map
 # falls back to normal palette assignment, so new client types still render.
+# One hue, one meaning. Kiro purple #9046FF is reserved for Power tier ONLY
+# (and the "primary/now" UI convention) - it is deliberately NOT reused as a
+# client color or in the auto/model palette, so a viewer never sees the same
+# swatch mean two different things on one sheet. Tier and client now share ZERO
+# hexes. Pro uses a LIGHT blue (#4DA6FF) rather than #0972D3 so it stays
+# distinguishable from Power-purple under protanopia (purple/blue converge for
+# red-blind viewers; the lightness gap rescues it).
 _TIER_COLORS = {
-    "Pro":     "#0972D3",   # AWS blue
+    "Pro":     "#4DA6FF",   # light cyan-blue (separates from Power-purple under CVD)
     "Pro+":    "#E7157B",   # magenta
-    "Power":   "#9046FF",   # Kiro purple (the headline / highest tier)
+    "Power":   "#9046FF",   # Kiro purple - the ONE reserved meaning of brand purple
     "Unknown": "#8C8C8C",   # grey - de-emphasized
 }
 _CLIENT_COLORS = {
-    "KIRO_IDE": "#9046FF",  # Kiro purple (the dominant surface)
+    "KIRO_IDE": "#0972D3",  # AWS blue - the dominant surface (moved OFF brand purple)
     "KIRO_CLI": "#FF8C00",  # warm orange
-    "PLUGIN":   "#0972D3",  # AWS blue
+    "PLUGIN":   "#00A4A6",  # teal (moved off blue so it no longer clashes with IDE)
 }
 # Map a color dimension's column name -> its fixed value/color dict, so helpers
 # can auto-apply the right ColorMap when they color/stack by that column.

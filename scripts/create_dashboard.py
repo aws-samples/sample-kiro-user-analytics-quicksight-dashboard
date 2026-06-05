@@ -767,6 +767,14 @@ def _bar_time_stacked(visual_id: str, title: str, dataset: str, date_col: str,
         "BarsArrangement": "STACKED",
         "Orientation": "VERTICAL",
         "FieldWells": {"BarChartAggregatedFieldWells": field_wells},
+        # Bar charts default to sorting categories by value DESC, which on a
+        # time axis scrambles the days (May 12, 14, 13...). Force chronological
+        # order by sorting the date category ascending.
+        "SortConfiguration": {
+            "CategorySort": [{
+                "FieldSort": {"FieldId": f"{visual_id}-d", "Direction": "ASC"},
+            }],
+        },
     }
     if stack_col:
         field_wells["Colors"] = [{

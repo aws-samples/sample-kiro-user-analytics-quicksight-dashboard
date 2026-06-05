@@ -743,10 +743,14 @@ def _area(visual_id: str, title: str, dataset: str, date_col: str, value_col: st
 
 
 def _bar_time_stacked(visual_id: str, title: str, dataset: str, date_col: str,
-                      value_col: str, stack_col: str | None = None):
-    """Vertical stacked bar over a daily date axis, stacked by `stack_col`.
-    Drop-in replacement for _area(): sparse data reads as discrete bars per
-    day instead of a filled area that exaggerates a few scattered points."""
+                      value_col: str, stack_col: str | None = None,
+                      arrangement: str = "STACKED", agg: str = "SUM"):
+    """Vertical bar over a daily date axis, optionally split by `stack_col`.
+    Replaces _area()/_line(): sparse data reads as discrete per-day bars
+    instead of a filled area or an interpolated line that invents usage on
+    days with no data. `arrangement` is STACKED or CLUSTERED - use CLUSTERED
+    when the split series must NOT be summed (e.g. distinct active users by
+    client, where a cross-client user would be double-counted by a stack)."""
     field_wells = {
         "Category": [{
             "DateDimensionField": {
@@ -759,12 +763,12 @@ def _bar_time_stacked(visual_id: str, title: str, dataset: str, date_col: str,
             "NumericalMeasureField": {
                 "FieldId": f"{visual_id}-v",
                 "Column": {"DataSetIdentifier": dataset, "ColumnName": value_col},
-                "AggregationFunction": {"SimpleNumericalAggregation": "SUM"},
+                "AggregationFunction": {"SimpleNumericalAggregation": agg},
             },
         }],
     }
     bar_config = {
-        "BarsArrangement": "STACKED",
+        "BarsArrangement": arrangement,
         "Orientation": "VERTICAL",
         "FieldWells": {"BarChartAggregatedFieldWells": field_wells},
         # Bar charts default to sorting categories by value DESC, which on a
@@ -786,6 +790,47 @@ def _bar_time_stacked(visual_id: str, title: str, dataset: str, date_col: str,
         cmap = _color_map(f"{visual_id}-c", stack_col)
         if cmap:
             bar_config["VisualPalette"] = {"ColorMap": cmap}
+    return {
+        "BarChartVisual": {
+            "VisualId": visual_id,
+            "Title": {"Visibility": "VISIBLE", "FormatText": {"PlainText": title}},
+            "ChartConfiguration": bar_config,
+        },
+    }
+
+
+def _bar_time_multi(visual_id: str, title: str, dataset: str, date_col: str,
+                    value_cols: list[tuple[str, str]], arrangement: str = "STACKED",
+                    agg: str = "SUM"):
+    """Vertical bar over a daily date axis with multiple value series (one
+    measure per (column, label) pair). Bar-chart replacement for _line_multi -
+    e.g. new vs returning users, where the two series are separate columns and
+    STACKED gives the meaningful total (new + returning = daily active)."""
+    bar_config = {
+        "BarsArrangement": arrangement,
+        "Orientation": "VERTICAL",
+        "FieldWells": {"BarChartAggregatedFieldWells": {
+            "Category": [{
+                "DateDimensionField": {
+                    "FieldId": f"{visual_id}-d",
+                    "Column": {"DataSetIdentifier": dataset, "ColumnName": date_col},
+                    "DateGranularity": "DAY",
+                },
+            }],
+            "Values": [{
+                "NumericalMeasureField": {
+                    "FieldId": f"{visual_id}-v{i}",
+                    "Column": {"DataSetIdentifier": dataset, "ColumnName": col},
+                    "AggregationFunction": {"SimpleNumericalAggregation": agg},
+                },
+            } for i, (col, _label) in enumerate(value_cols)],
+        }},
+        "SortConfiguration": {
+            "CategorySort": [{
+                "FieldSort": {"FieldId": f"{visual_id}-d", "Direction": "ASC"},
+            }],
+        },
+    }
     return {
         "BarChartVisual": {
             "VisualId": visual_id,
@@ -943,12 +988,23 @@ def _table(visual_id: str, title: str, dataset: str,
     }
     if sort_by:
         col, direction = sort_by
+        # The SortBy aggregation MUST match how the column is displayed,
+        # otherwise the rows order by a different number than the one shown.
+        # e.g. credits_used is displayed as SUM (total per user); sorting it by
+        # MAX (each user's single highest day) makes the table look unsorted.
+        # Look up the column's agg in `values`; default to SUM for a value not
+        # in the list, and MAX only for an unaggregated/calc column (agg=None).
+        sort_agg = "SUM"
+        for v in values:
+            if v[0] == col:
+                sort_agg = v[1] if v[1] is not None else "MAX"
+                break
         config["SortConfiguration"] = {
             "RowSort": [{
                 "ColumnSort": {
                     "SortBy": {"DataSetIdentifier": dataset, "ColumnName": col},
                     "Direction": direction,
-                    "AggregationFunction": {"NumericalAggregationFunction": {"SimpleNumericalAggregation": "MAX"}},
+                    "AggregationFunction": {"NumericalAggregationFunction": {"SimpleNumericalAggregation": sort_agg}},
                 },
             }],
         }
@@ -1085,7 +1141,7 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
     # ("daily messages by client", etc.) live on the Activity sheet so
     # Executive stays a single-screen summary.
     exec_visuals += [
-        _sub(_line("xv-overage", "Daily overage credits", "trends", "activity_date", "overage_credits_used"),
+        _sub(_bar_time_stacked("xv-overage", "Daily overage credits", "trends", "activity_date", "overage_credits_used"),
              "Total overage credits consumed per day. Sustained increases suggest customers approaching or exceeding plan capacity."),
         _sub(_period_compare_bar("xv-period",
                                  "Messages by tier - prior 30d vs current 30d"),
@@ -1123,9 +1179,13 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
                 # dimension double-counts users active in >1 tier and inflates
                 # DAU. daily_trends.active_users is COUNT(DISTINCT user_id) per
                 # (date, client) - the correct per-client daily active count.
-                _sub(_line("a-active",      "Daily active users (by client)", "trends", "activity_date", "active_users", color_col="client_type"),
-                     "Daily active users (distinct), by client - see if engagement is concentrated in IDE, CLI, or Plugin."),
-                _sub(_line("a-messages",    "Daily messages (by client)",     "tiers", "activity_date", "messages",      color_col="client_type"),
+                # CLUSTERED, not stacked: active_users is a distinct-user count
+                # per (date, client); a user active in >1 client would be
+                # double-counted by a stacked total, so show the clients
+                # side-by-side instead of summing them.
+                _sub(_bar_time_stacked("a-active",      "Daily active users (by client)", "trends", "activity_date", "active_users", stack_col="client_type", arrangement="CLUSTERED"),
+                     "Daily active users (distinct), by client - see if engagement is concentrated in IDE, CLI, or Plugin. Bars are side-by-side (not stacked) because a user active in two clients can't be summed into one total."),
+                _sub(_bar_time_stacked("a-messages",    "Daily messages (by client)",     "tiers", "activity_date", "messages",      stack_col="client_type"),
                      "Daily message volume by client. The mix shifts as users change which surfaces they prefer."),
                 # Single large stacked area for the headline cost story.
                 _sub(_bar_time_stacked("a-credits",     "Daily credits used (by client)", "tiers", "activity_date", "credits_used", stack_col="client_type"),
@@ -1136,28 +1196,42 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
                      "Daily distinct users by tier (each counted once per day). POWER share rising = good adoption."),
                 # New vs returning active users per day - the adoption/onboarding
                 # signal. new_users / returning_users are separate columns on
-                # daily_trends, so this is a two-series line (not a pivot-stacked
-                # area). Aggregated across clients by the date grouping.
-                _sub(_line_multi("a-new-returning", "Daily new vs returning users", "trends",
+                # daily_trends. STACKED bars: the two are mutually exclusive
+                # (a user is new OR returning on a given day), so the stack
+                # total reads as that day's total active users.
+                _sub(_bar_time_multi("a-new-returning", "Daily new vs returning users", "trends",
                                  "activity_date",
                                  [("new_users", "New"), ("returning_users", "Returning")]),
                      "Daily new (first-ever-seen) vs returning active users. A healthy adoption curve shows returning users growing while new users stay steady or rise."),
-                # One stacked bar for model usage - replaces the bar+line pair.
-                _sub(_bar_time_stacked("a-models",      "Daily messages by model",        "models", "activity_date", "messages", stack_col="model_name"),
-                     "Daily messages stacked by model. New models appear automatically; the relative bar height shows adoption. Responds to both the date range and the Tier picker."),
+                # 100%-stacked bar (STACKED_PERCENT): with 7+ models that grow
+                # over time, an absolute stacked bar is unreadable color-soup
+                # and small segments get crushed. Normalizing each day to 100%
+                # answers the real question - what's the model MIX and how is it
+                # shifting - rather than absolute volume (which the by-client
+                # message/credit charts already cover). Empty days stay empty
+                # (no bar), so no interpolation.
+                _sub(_bar_time_stacked("a-models", "Daily message mix by model", "models", "activity_date", "messages", stack_col="model_name", arrangement="STACKED_PERCENT"),
+                     "Each day's bar is normalized to 100% - segments show each model's SHARE of that day's messages, so you can see the model mix shift over time. New models appear automatically. Responds to both the date range and the Tier picker."),
             ],
-            # Reading flow: who's using -> what they're sending -> what it costs.
+            # Reading flow: cost -> adoption -> engagement -> model detail.
+            # Credits leads as the hero (it's the cost story admins open this
+            # sheet for); the two "active users" cuts sit side by side as one
+            # adoption group with new-vs-returning demoted to a narrow tile
+            # (it's the weakest signal, especially at low user counts); the
+            # model heat map closes the sheet full-width (most detailed/
+            # exploratory, reads best wide).
             "Layouts": [{"Configuration": _grid([
-                # Row 1: WHO - active users by client + by tier, side by side.
-                ("a-active",      0,  0, 18, 6),
-                ("a-tier-trend", 18,  0, 18, 6),
-                # Row 2: WHO (cont.) - new vs returning adoption trend.
-                ("a-new-returning", 0,  6, 36, 6),
-                # Row 3: WHAT - messages, two views.
-                ("a-messages",    0, 12, 36, 7),
-                ("a-models",      0, 19, 36, 7),
-                # Row 4: COST - credits.
-                ("a-credits",     0, 26, 36, 8),
+                # Row 1: COST - credits, the hero tile.
+                ("a-credits",     0,  0, 36, 9),
+                # Row 2: ADOPTION - active users by client + by tier, with
+                # new-vs-returning demoted to a narrow tile alongside them.
+                ("a-active",        0,  9, 14, 7),
+                ("a-tier-trend",   14,  9, 14, 7),
+                ("a-new-returning", 28,  9,  8, 7),
+                # Row 3: ENGAGEMENT - daily messages by client.
+                ("a-messages",    0, 16, 36, 7),
+                # Row 4: MODEL DETAIL - messages-by-model heat map, full width.
+                ("a-models",      0, 23, 36, 9),
             ])}],
         },
 
@@ -1406,9 +1480,9 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
                 # distinct-count calc field avoids that.
                 _sub(_kpi_sparkline_calc("u-days", "Active days", "base", "active_days_calc", "activity_date"),
                      "Distinct days this user was active in the selected window."),
-                _sub(_line("u-daily",   "Daily messages",          "base",  "activity_date", "total_messages"),
+                _sub(_bar_time_stacked("u-daily",   "Daily messages",          "base",  "activity_date", "total_messages"),
                      "Per-day message volume for the selected user."),
-                _sub(_line("u-credits-line", "Daily credits used", "base",  "activity_date", "credits_used"),
+                _sub(_bar_time_stacked("u-credits-line", "Daily credits used", "base",  "activity_date", "credits_used"),
                      "Per-day credit consumption for the selected user."),
                 _sub(_pie("u-models", "Model split",               "models", "model_name", "messages"),
                      "How this user's messages are distributed across models."),

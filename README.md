@@ -20,7 +20,9 @@ For Kiro **cost and seat utilization** questions (per-user spend, idle seats, bi
 
 ![Architecture diagram](./docs/architecture.png)
 
-Kiro writes a daily user activity report to a customer-owned Amazon S3 bucket. An AWS Glue crawler registers the CSV files as a table in the AWS Glue Data Catalog. Amazon Athena views curate the data. Amazon QuickSight datasets import the curated views into SPICE and refresh daily. The published dashboard exposes five sheets - Executive, Activity & Trends, People, Economics, and User detail - with model, tier, and date-range pickers across the sheets.
+Kiro writes a daily user activity report to a customer-owned Amazon S3 bucket. An AWS Lambda function reads those CSVs by header and writes a fixed-schema normalized copy (a stable "facts" dataset plus a long-form per-model "messages" dataset), partitioned by export date, back to the results bucket; Amazon Athena partitioned external tables plus dedup views curate that normalized data. Amazon QuickSight datasets import the curated views into SPICE and refresh daily. The published dashboard exposes five sheets - Executive, Activity & Trends, People, Economics, and User detail - with model, tier, and date-range pickers across the sheets.
+
+Reading the raw report by header (rather than crawling it into a positional table) is deliberate: the report's columns drift over time - Kiro adds a new `<model>_messages` column whenever it launches a model, and the trailing `New_User` column is present in some exports and not others - so a positional table misattributes per-model usage and corrupts `new_user`. The normalizer keys every value by its header name, which is immune to that drift.
 
 ## Dashboard preview
 
@@ -72,7 +74,7 @@ Most visuals respond to the date-range picker, but a few use a **fixed window** 
 
 ### Pre-requisites
 
-* An [AWS account](https://aws.amazon.com/account/) with permissions to deploy AWS CloudFormation stacks and create the resources used by this solution: AWS Glue (database, crawler, IAM role), Amazon Athena (workgroup), Amazon S3 (one results bucket), and Amazon QuickSight (data source, datasets, refresh schedules, analysis, dashboard). Administrator access is sufficient but not required - the equivalent service permissions work.
+* An [AWS account](https://aws.amazon.com/account/) with permissions to deploy AWS CloudFormation stacks and create the resources used by this solution: AWS Glue (database), Amazon Athena (workgroup), AWS Lambda (the report normalizer + IAM role) and Amazon EventBridge (its daily schedule), Amazon S3 (one results bucket), and Amazon QuickSight (data source, datasets, refresh schedules, analysis, dashboard). Administrator access is sufficient but not required - the equivalent service permissions work.
 * The Kiro **User Activity Report** export to Amazon S3 enabled by a Kiro administrator. See the [Kiro user activity report documentation](https://kiro.dev/docs/enterprise/monitor-and-track/user-activity/).
 * **Amazon QuickSight Enterprise edition** active in the same AWS Region as the Amazon S3 bucket. The Athena data source cannot cross AWS Regions.
 * Amazon Athena enabled in QuickSight (QuickSight -> Manage account -> Permissions -> AWS resources -> check **Athena**). The deploy script does not toggle this for you - Amazon QuickSight requires the toggle to be set via the console. The same screen also asks you to select Amazon S3 buckets; leave the S3 selection empty (the deploy script handles S3 access separately, see the next bullet). When you click Save, QuickSight should attach the `AWSQuicksightAthenaAccess` managed policy to the QuickSight service role - in some accounts this attachment silently fails. The deploy script verifies the policy is attached and offers to attach it for you if it is not.
@@ -126,7 +128,7 @@ Most visuals respond to the date-range picker, but a few use a **fixed window** 
    Optional environment variables:
 
    * **HASH_EMAILS** (default `false`): SHA-256 emails at the view layer so plaintext does not reach SPICE.
-   * **KMS_KEY_ARN** (default empty): AWS Key Management Service (AWS KMS) key ARN that encrypts the Kiro logs bucket. The crawler role is granted `kms:Decrypt` on this key.
+   * **KMS_KEY_ARN** (default empty): AWS Key Management Service (AWS KMS) key ARN that encrypts the Kiro logs bucket. The report-normalizer Lambda role is granted `kms:Decrypt` on this key.
    * **STACK_PREFIX** (default `kiro-analytics`): Prefix for the two AWS CloudFormation stacks.
    * **QS_IAM_ROLE_NAME** (default `aws-quicksight-service-role-v0`): The IAM role QuickSight uses to access AWS resources. Change this if your QS account is configured under QuickSight -> Manage account -> Permissions -> IAM role -> "Use an existing role" - set it to the name of that existing role. The deploy script confirms the role with you before writing to it.
    * **THEME_MODE** (default `light`): Set to `dark` for a dark-mode dashboard. The Kiro purple categorical palette is the same in both modes; only the background and text colors flip.
@@ -134,7 +136,7 @@ Most visuals respond to the date-range picker, but a few use a **fixed window** 
    * **IDENTITY_STORE_ID** (required when `IDENTITY_MAPPING=true`): The Identity Store id, which **starts with `d-`** (e.g. `d-1234567890`). This is *not* the Identity Center instance ARN or `ssoins-` instance id. Find it on the IAM Identity Center **Settings** page, or run `aws sso-admin list-instances --query 'Instances[].IdentityStoreId'`. The deploy script rejects an instance ARN / `ssoins-` value with a pointer to the right one.
    * **IDC_REGION** (default `AWS_REGION`): The AWS Region IAM Identity Center lives in. It can differ from the dashboard region (for example, Identity Center in `eu-west-1` while the data and dashboard are in `us-east-1`).
    * **IDC_ROLE_ARN** (default empty): Optional. ARN of a role to assume when IAM Identity Center lives in a different AWS account (the organization management or a delegated-admin account). Leave empty for same-account Identity Center.
-   * **IDENTITY_MAP_REFRESH_SCHEDULE** (default `cron(30 3 * * ? *)`): EventBridge schedule for the daily identity-map refresh (03:30 UTC, between the 03:00 crawler and the 04:00 SPICE refresh).
+   * **IDENTITY_MAP_REFRESH_SCHEDULE** (default `cron(30 3 * * ? *)`): EventBridge schedule for the daily identity-map refresh (03:30 UTC, after the 03:15 report normalizer and before the 04:00 SPICE refresh).
 
 3. Run the preflight check.
 
@@ -150,7 +152,7 @@ Most visuals respond to the date-range picker, but a few use a **fixed window** 
    scripts/deploy.sh
    ```
 
-   The deploy script creates two AWS CloudFormation stacks (data layer and QuickSight layer), runs the AWS Glue crawler, builds Amazon Athena views, attaches an inline IAM policy to the QuickSight service role for S3 access, and creates the QuickSight Analysis and Dashboard. End-to-end runtime is approximately five minutes.
+   The deploy script creates two AWS CloudFormation stacks (data layer and QuickSight layer), invokes the report-normalizer Lambda, builds Amazon Athena external tables and views, attaches an inline IAM policy to the QuickSight service role for S3 access, and creates the QuickSight Analysis and Dashboard. End-to-end runtime is approximately five minutes.
 
    On a brand-new account, the deploy needs to write an inline IAM policy granting QuickSight access to the two S3 buckets it uses. The behavior depends on how you invoke the script:
 
@@ -207,9 +209,9 @@ The five sheets:
 
 The solution is layered:
 
-1. **Data layer** (`cfn/01-data-layer.yaml`): An AWS Glue database, one crawler over the User Activity Report, an Amazon Athena workgroup, and an Amazon S3 results bucket. The crawler runs daily at 03:00 UTC, one hour after Kiro's 02:00 UTC export.
+1. **Data layer** (`cfn/01-data-layer.yaml`): An AWS Glue database, an Amazon Athena workgroup, an Amazon S3 results bucket, and a **report-normalizer AWS Lambda** (`scripts/normalize_report_lambda.py`). The Lambda reads the raw Kiro CSVs by header and writes fixed-schema output to the results bucket, partitioned by export date: `normalized/facts/export_date=YYYY-MM-DD/` (stable scalar columns, one row per date/user/client) and `normalized/models/export_date=YYYY-MM-DD/` (long form, one row per date/user/client/model/messages). It runs daily at 03:15 UTC, after Kiro's 02:00 UTC export. The Lambda is **streaming and incremental**: it processes one file at a time (so memory is flat regardless of seat count or history depth) and skips files it has already normalized (keyed on the source object + ETag, so a re-exported file is reprocessed automatically). This scales to large fleets - it has been validated at 300 users / 120 days, and steady-state daily runs touch only the new file.
 
-2. **Curated views** (`athena/*.sql`): Eleven Amazon Athena views applied by `scripts/build_views.py`. The build script discovers the dynamic per-model columns (e.g. `auto_messages`, `claude_opus_4.6_messages`) from the live AWS Glue table and renders the model unpivot at deploy time. Other views compute daily trends (including new vs returning users), per-user totals, tier breakdowns, engagement segmentation, an activity heatmap, cohort retention, period comparison, and week-over-week movers. (The People-sheet engagement funnel is computed in QuickSight from the base view rather than as its own Athena view, so it responds to the date range.)
+2. **Curated views** (`athena/*.sql`): `scripts/build_views.py` registers two **partitioned** Amazon Athena external tables (`report_facts_raw`, `report_models_raw`) over the normalized parts, using **partition projection** on `export_date` so no partition registration (`MSCK`/`ADD PARTITION`) is ever needed. On top of those it creates two dedup **views** (`report_facts`, `report_models`) that keep only the latest export per date/user/client via `ROW_NUMBER()` (latest-export-wins) - so deduplication happens in SQL at query time, which scales to any history size while the header parsing stays in the Lambda. `base_user_activity` and `user_dim` read `report_facts`; `model_usage` is a straight projection of the long-form `report_models` (no model unpivot needed - the Lambda already melted the per-model columns into rows, so new Kiro models add rows, never columns). Other views compute daily trends (including new vs returning users), per-user totals, tier breakdowns, engagement segmentation, an activity heatmap, cohort retention, period comparison, and week-over-week movers. (The People-sheet engagement funnel is computed in QuickSight from the base view rather than as its own Athena view, so it responds to the date range.)
 
 3. **QuickSight DataSource and DataSets** (`cfn/02-quicksight.yaml`): One Amazon Athena DataSource and 10 SPICE datasets, each with a daily 04:00 UTC refresh schedule.
 
@@ -221,19 +223,19 @@ The solution is layered:
 
 * **Hash emails before they reach SPICE**: Set `HASH_EMAILS=true`. The base view replaces `email` with `to_hex(sha256(email))`. The user labels in tables and the User detail drill-down show opaque digests instead of plaintext.
 
-* **Encrypted Kiro logs bucket**: Set `KMS_KEY_ARN=arn:aws:kms:...`. The crawler IAM role is granted `kms:Decrypt` and `kms:DescribeKey` on the key. The KMS key policy must permit the crawler role:
+* **Encrypted Kiro logs bucket**: Set `KMS_KEY_ARN=arn:aws:kms:...`. The normalizer Lambda's IAM role is granted `kms:Decrypt` on the key. The KMS key policy must permit the normalizer role:
 
    ```json
    {
-     "Sid": "Allow AWS Glue crawler",
+     "Sid": "Allow Kiro report normalizer",
      "Effect": "Allow",
-     "Principal": { "AWS": "arn:aws:iam::<account>:role/<stack-prefix>-data-GlueCrawlerRole-XXXX" },
-     "Action": ["kms:Decrypt", "kms:DescribeKey"],
+     "Principal": { "AWS": "arn:aws:iam::<account>:role/<stack-prefix>-data-NormalizerLambdaRole-XXXX" },
+     "Action": ["kms:Decrypt"],
      "Resource": "*"
    }
    ```
 
-* **Re-deploy after Kiro adds a new model**: The AWS Glue crawler picks up new `<model>_messages` columns automatically on its next run. To pick them up immediately, re-run `scripts/deploy.sh`. The build script rewrites the `model_usage` view with the latest column set.
+* **Kiro adds a new model**: No action needed. Because the normalizer melts per-model columns into rows keyed by header name, a new `<model>_messages` column is picked up automatically on the Lambda's next daily run and appears as a new `model_name` value - no schema change, no re-deploy. (Re-run `scripts/deploy.sh` only if you want it reflected immediately rather than at the next scheduled run.)
 
 * **Row-level security**: Not configured by default. Add a QuickSight RLS dataset rule keyed on `subscription_tier`, `user_id`, or another column to scope visuals per viewer.
 
@@ -280,7 +282,7 @@ aws sso-admin list-instances --query 'Instances[].IdentityStoreId' --output text
 * **`scripts/preflight.sh` or `scripts/deploy.sh` hangs at the Kiro export layout / prefix detection step**: the script is running `aws s3 ls --recursive` to auto-detect `KIRO_LOGS_PREFIX`. On large buckets that hold other content (Amazon Q logs, other AWS service logs, prompt logs from another product) this can take many minutes and incurs an S3 LIST charge per 1000 keys scanned. Interrupt with Ctrl-C, find the prefix non-recursively (`aws s3 ls "s3://${KIRO_LOGS_BUCKET}/" --region "${AWS_REGION}"`), set `KIRO_LOGS_PREFIX` explicitly (e.g. `export KIRO_LOGS_PREFIX="usage-activity/"`), and re-run.
 * **`AthenaDataSource` fails with "Unable to verify/create output bucket"**: QuickSight does not have write access to the Athena results bucket. Re-run `scripts/deploy.sh` - the permission check will detect missing actions and offer to apply them. See [QuickSight permission errors](https://repost.aws/knowledge-center/quicksight-permission-errors) and [Athena output bucket error](https://repost.aws/knowledge-center/athena-output-bucket-error) for background.
 * **`scripts/deploy.sh` reports a stack is in `ROLLBACK_COMPLETE`**: the script will detect and delete the rolled-back QuickSight stack automatically before re-deploying. If the data stack is stuck, run `scripts/teardown.sh` and start fresh.
-* **The AWS Glue crawler reports `LastCrawl.Status: FAILED`**: most often the crawler IAM role cannot read the Kiro logs bucket. Check the bucket policy and (for KMS-encrypted buckets) the KMS key policy. Set `KMS_KEY_ARN` before re-deploying if encryption is in play.
+* **The report-normalizer Lambda fails or the dashboard is empty**: check the Lambda's CloudWatch logs (`/aws/lambda/<stack-prefix>-data-normalize-report`). The most common cause is that its IAM role cannot read the Kiro logs bucket - verify the bucket policy and (for KMS-encrypted buckets) the KMS key policy, and set `KMS_KEY_ARN` before re-deploying if encryption is in play. The Lambda fails closed (leaves the previous normalized output in place), so a transient failure does not blank the dashboard.
 * **Identity mapping is on but the dashboard still shows GUIDs**: the synchronous Lambda invoke at deploy time failed (the deploy prints a warning and continues - an identity-map failure never blocks the dashboard). Common causes: the `IDENTITY_STORE_ID` is wrong (it must start with `d-`), the deploy credentials lack `identitystore:ListUsers` in `IDC_REGION`, or (for cross-account Identity Center) `IDC_ROLE_ARN` is unset or its trust policy does not permit the Lambda role. Check the Lambda's CloudWatch logs (`/aws/lambda/<prefix>-identity-map`), fix the cause, and re-run `scripts/deploy.sh`. Users on an external IdP / Builder ID / social login keep their GUID by design.
 
 ## Cleaning up
@@ -318,8 +320,8 @@ responsibility model.
 
 | Data store | Encryption | Configured by |
 |------------|------------|---------------|
-| Kiro logs Amazon S3 bucket (source) | Customer-managed. Set SSE-S3 or SSE-KMS on the bucket; pass the KMS key ARN via `KMS_KEY_ARN` so the AWS Glue crawler is granted `kms:Decrypt`. | Customer |
-| Athena results Amazon S3 bucket | SSE-S3 (`AES256`) by default, plus a TLS-only bucket policy and 30-day result lifecycle. Versioning enabled. Server access logging is opt-in (CloudTrail covers Athena API events at the account level). | This stack |
+| Kiro logs Amazon S3 bucket (source) | Customer-managed. Set SSE-S3 or SSE-KMS on the bucket; pass the KMS key ARN via `KMS_KEY_ARN` so the report-normalizer Lambda is granted `kms:Decrypt`. | Customer |
+| Athena results Amazon S3 bucket | SSE-S3 (`AES256`) by default, plus a TLS-only bucket policy. Versioning enabled. Lifecycle: `query-results/` expires after 30 days; `normalized/` (the dashboard's source data) is retained. Server access logging is opt-in (CloudTrail covers Athena API events at the account level). | This stack |
 | Amazon Athena query results | `EncryptionConfiguration: SSE_S3` enforced by `EnforceWorkGroupConfiguration: true` on the workgroup. | This stack |
 | Identity-map Amazon S3 bucket (only when `IDENTITY_MAPPING=true`) | SSE-KMS with a dedicated customer-managed key (rotation enabled), plus server access logging, versioning, a TLS-only bucket policy, and a 30-day noncurrent-version lifecycle. Holds resolved names/emails (PII), isolated from the rest of the solution's data. | This stack |
 | Amazon QuickSight SPICE | Encrypted at rest with service-managed keys. There is no CFN property to configure SPICE encryption; it is on by default for Enterprise edition. | Amazon QuickSight |

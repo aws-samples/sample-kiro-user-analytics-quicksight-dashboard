@@ -2,19 +2,20 @@
 """
 Render and execute the Athena views in athena/.
 
-Most views are static and only need ${database} substituted. The model_usage view contains a
-${model_case_expression} placeholder that is filled at deploy time by
-inspecting the live raw_user_report table - Athena cannot dereference column
-names dynamically, so the unpivot is generated as a CASE chain.
+First creates the report_facts / report_models external tables over the
+normalized CSVs that normalize_report_lambda lands in the results bucket, then
+renders the views (which read those tables). Views only need ${database} and a
+few label placeholders substituted; the old per-model UNION-ALL melt is gone -
+model_usage now reads the long-form report_models table directly.
 
 Usage:
     python scripts/build_views.py \\
         --database kiro_analytics \\
         --workgroup kiro_analytics \\
-        --region us-east-1
+        --region us-east-1 \\
+        --normalized-bucket <athena-results-bucket>
 
-Requires AWS credentials with athena:StartQueryExecution and
-glue:GetTable on the database.
+Requires AWS credentials with athena:StartQueryExecution on the workgroup.
 """
 from __future__ import annotations
 
@@ -30,37 +31,18 @@ import boto3
 VIEWS_DIR = pathlib.Path(__file__).resolve().parent.parent / "athena"
 
 
-def get_columns(glue, database: str, table: str) -> list[str]:
-    resp = glue.get_table(DatabaseName=database, Name=table)
-    return [c["Name"] for c in resp["Table"]["StorageDescriptor"]["Columns"]]
+def email_expression(hash_emails: bool) -> str:
+    """report_facts always carries an `email` column (blank when the source
+    export predates the April-2026 email field), so we always reference it.
 
-
-def list_model_columns(columns: list[str]) -> list[str]:
-    """Per-model columns: end with '_messages', exclude 'total_messages'."""
-    return [
-        c for c in columns
-        if c.lower().endswith("_messages") and c.lower() != "total_messages"
-    ]
-
-
-def email_expression(columns: list[str], hash_emails: bool) -> str:
-    """If raw_user_report has an `email` column, reference it; otherwise
-    fall back to NULL so the view compiles. Column lookup is case-insensitive
-    because the crawler can preserve mixed case.
-
-    If hash_emails is True, wrap the column in to_hex(sha256(...)) so PII
-    does not reach SPICE. The view layer then sees opaque hex digests.
+    If hash_emails is True, wrap it in to_hex(sha256(...)) so PII does not
+    reach SPICE - the view layer then sees opaque hex digests. NULLIF maps the
+    empty-string blank to NULL first so a hashed blank doesn't become a
+    constant non-empty digest.
     """
-    column = None
-    for c in columns:
-        if c.lower() == "email":
-            column = c
-            break
-    if column is None:
-        return "CAST(NULL AS varchar)"
     if hash_emails:
-        return f"to_hex(sha256(CAST({column} AS varbinary)))"
-    return column
+        return "to_hex(sha256(CAST(NULLIF(email, '') AS varbinary)))"
+    return "email"
 
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
@@ -81,83 +63,145 @@ def _validate_identifier(value: str, kind: str) -> str:
     return value
 
 
-def render_model_union(
-    database: str,
-    model_columns: list[str],
-    email_expr: str,
-    label_expr: str,
-    identity_join: str,
-) -> str:
-    """Build a UNION ALL of one SELECT per discovered <model>_messages column.
-    Each branch unpivots that column into (model_name, messages) rows. Each
-    row also carries user_label so the drill-by-user filter on the User-detail
-    sheet has a column to match on - `label_expr` is the exact same expression
-    rendered into base_user_activity / user_dim (with or without the identity
-    map), so the three views always agree on a user's label.
+# --- Normalized report tables -----------------------------------------------
+# normalize_report_lambda parses the raw Kiro CSVs by HEADER and lands one
+# output part per source file, partitioned by export_date, under:
+#   normalized/facts/export_date=YYYY-MM-DD/part-<hash>.csv
+#   normalized/models/export_date=YYYY-MM-DD/part-<hash>.csv
+# Every row carries src_path + export_ts bookkeeping columns.
+#
+# We register each as a PARTITIONED external table (report_facts_raw /
+# report_models_raw) with partition PROJECTION on export_date - so no
+# MSCK REPAIR / ADD PARTITION is ever needed - then layer a dedup VIEW
+# (report_facts / report_models) on top that keeps only the latest export per
+# key via ROW_NUMBER(). The rest of the pipeline reads the deduped views and is
+# unchanged. OpenCSVSerDe is positional, but safe here: WE author the parts
+# with a fixed, known column order (unlike the raw export, whose middle columns
+# drift). Dedup lives in SQL (where it scales to any history size) while the
+# header-binding lives in the Lambda (the one thing Athena CSV cannot do).
 
-    `identity_join` is "" normally, or a LEFT JOIN onto the identity_map table
-    when identity mapping is enabled (see render_identity_label_parts).
-
-    Security note: this function constructs SQL by string interpolation
-    because Athena does not support parameterized DDL. Every interpolated
-    value originates from a trusted source - `database` is a CFN parameter,
-    `model_columns` are column names returned by AWS Glue get-table,
-    `email_expr` is one of two literal strings we construct ourselves
-    (the column ref or `to_hex(sha256(...))`), and `label_expr`/`identity_join`
-    are built from `database` + literals here. We additionally re-validate
-    each identifier with `_validate_identifier` before interpolation.
-    Bandit B608 is therefore a known false positive for this construction;
-    see the `# nosec` annotation on the f-string below."""
+def report_tables_ddl(database: str, bucket: str, prefix: str) -> list[str]:
+    """DROP + CREATE for the report_facts/report_models dedup views and their
+    underlying partitioned raw external tables. Returns statements in apply
+    order (drop views before tables; create tables before views)."""
     _validate_identifier(database, "database")
-    # subscription_tier carried on every model_usage row so the Tier picker can
-    # filter the model visuals (Daily messages by model, Top users by model,
-    # Model split). Normalized identically to base_user_activity / user_dim so
-    # the picker's values match across datasets.
-    tier_expr = (
-        "CASE upper(COALESCE(subscription_tier, ''))"
-        " WHEN 'PRO' THEN 'Pro'"
-        " WHEN 'PRO_PLUS' THEN 'Pro+'"
-        " WHEN 'POWER' THEN 'Power'"
-        " WHEN '' THEN 'Unknown'"
-        " ELSE subscription_tier END"
+    if not _S3_NAME_RE.match(bucket):
+        raise ValueError(f"Invalid normalized-data bucket name: {bucket!r}")
+    clean_prefix = prefix.strip("/")
+    if not _PREFIX_RE.match(clean_prefix):
+        raise ValueError(f"Invalid normalized-data prefix: {prefix!r}")
+    facts_loc = f"s3://{bucket}/{clean_prefix}/facts/"
+    models_loc = f"s3://{bucket}/{clean_prefix}/models/"
+    # Partition projection bounds: export_date is a DATE partition projected
+    # over a wide static range so any real export date resolves without
+    # registering partitions. The lower bound predates Kiro; the upper bound is
+    # far future. NOW is allowed so future-dated test data still projects.
+    proj = (
+        "    'projection.enabled' = 'true',\n"
+        "    'projection.export_date.type' = 'date',\n"
+        "    'projection.export_date.format' = 'yyyy-MM-dd',\n"
+        "    'projection.export_date.range' = '2020-01-01,NOW+1YEARS',\n"
+        "    'projection.export_date.interval' = '1',\n"
+        "    'projection.export_date.interval.unit' = 'DAYS',\n"
+        "    'storage.location.template' = '{loc}export_date=${{export_date}}/',\n"
+        "    'skip.header.line.count' = '1'"
     )
-    if not model_columns:
-        return (
-            "SELECT\n"
-            "    CAST(NULL AS date)    AS activity_date,\n"
-            "    CAST(NULL AS varchar) AS user_id,\n"
-            "    CAST(NULL AS varchar) AS user_label,\n"
-            "    CAST(NULL AS varchar) AS client_type,\n"
-            "    CAST(NULL AS varchar) AS subscription_tier,\n"
-            "    CAST(NULL AS varchar) AS model_name,\n"
-            "    CAST(NULL AS bigint)  AS messages\n"
-            "WHERE 1 = 0"
-        )
-    branches = []
-    for name in model_columns:
-        _validate_identifier(name, "model column")
-        model_name = name[:-len("_messages")] if name.lower().endswith("_messages") else name
-        # Quote the column ref because real-world model columns can contain
-        # characters that break Athena's identifier parser, e.g.
-        # claude_opus_4.6_messages where the '.6' is read as a number literal.
-        col = f'"{name}"'
-        join_clause = f"\n{identity_join}" if identity_join else ""
-        # nosec B608 - identifiers validated by _validate_identifier above;
-        # Athena DDL has no parameter binding so f-string is the only option.
-        branch_sql = (
-            f"SELECT\n"  # nosec B608
-            f"    CAST(date AS date)                              AS activity_date,\n"
-            f"    userid                                          AS user_id,\n"
-            f"    {label_expr}                                    AS user_label,\n"
-            f"    upper(client_type)                              AS client_type,\n"
-            f"    {tier_expr}                                     AS subscription_tier,\n"
-            f"    '{model_name}'                                  AS model_name,\n"
-            f"    COALESCE(TRY(CAST({col} AS bigint)), 0)         AS messages\n"
-            f"FROM {database}.raw_user_report{join_clause}\n"
-            f"WHERE COALESCE(TRY(CAST({col} AS bigint)), 0) > 0"
-        )
-        branches.append(branch_sql)
-    return "\nUNION ALL\n".join(branches)
+    # nosec B608 - database validated; bucket/prefix regex-validated above;
+    # every other token is a literal. Athena DDL has no parameter binding.
+    return [
+        # Drop report_facts/report_models in BOTH forms: a prior deploy created
+        # them as TABLES (the old non-partitioned design); this design makes
+        # them VIEWS. DROP VIEW won't remove a table and vice-versa, so issue
+        # both (IF EXISTS makes the non-matching one a no-op). Drop the
+        # dependent views/tables before the underlying raw tables.
+        f"DROP VIEW IF EXISTS {database}.report_facts",  # nosec B608
+        f"DROP VIEW IF EXISTS {database}.report_models",  # nosec B608
+        f"DROP TABLE IF EXISTS {database}.report_facts",  # nosec B608
+        f"DROP TABLE IF EXISTS {database}.report_models",  # nosec B608
+        f"DROP TABLE IF EXISTS {database}.report_facts_raw",  # nosec B608
+        f"DROP TABLE IF EXISTS {database}.report_models_raw",  # nosec B608
+        (
+            f"CREATE EXTERNAL TABLE {database}.report_facts_raw (\n"  # nosec B608
+            f"    date                 string,\n"
+            f"    userid               string,\n"
+            f"    client_type          string,\n"
+            f"    chat_conversations   string,\n"
+            f"    credits_used         string,\n"
+            f"    overage_cap          string,\n"
+            f"    overage_credits_used string,\n"
+            f"    overage_enabled      string,\n"
+            f"    profileid            string,\n"
+            f"    subscription_tier    string,\n"
+            f"    total_messages       string,\n"
+            f"    new_user             string,\n"
+            f"    email                string,\n"
+            f"    src_path             string,\n"
+            f"    export_ts            string\n"
+            f")\n"
+            f"PARTITIONED BY (export_date string)\n"
+            f"ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'\n"
+            f"WITH SERDEPROPERTIES ('separatorChar' = ',', 'quoteChar' = '\"')\n"
+            f"LOCATION '{facts_loc}'\n"
+            f"TBLPROPERTIES (\n{proj.format(loc=facts_loc)}\n)"
+        ),
+        (
+            f"CREATE EXTERNAL TABLE {database}.report_models_raw (\n"  # nosec B608
+            f"    date              string,\n"
+            f"    userid            string,\n"
+            f"    client_type       string,\n"
+            f"    subscription_tier string,\n"
+            f"    model_name        string,\n"
+            f"    messages          string,\n"
+            f"    src_path          string,\n"
+            f"    export_ts         string\n"
+            f")\n"
+            f"PARTITIONED BY (export_date string)\n"
+            f"ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'\n"
+            f"WITH SERDEPROPERTIES ('separatorChar' = ',', 'quoteChar' = '\"')\n"
+            f"LOCATION '{models_loc}'\n"
+            f"TBLPROPERTIES (\n{proj.format(loc=models_loc)}\n)"
+        ),
+        # Dedup view: one fact row per (date,user,client) - the latest export
+        # wins (highest export_ts, then src_path as a tiebreaker). This is the
+        # latest-export-wins rule the old base_user_activity applied via the
+        # "$path" pseudo-column, now done over the partitioned parts.
+        (
+            f"CREATE OR REPLACE VIEW {database}.report_facts AS\n"  # nosec B608
+            f"SELECT date, userid, client_type, chat_conversations, credits_used,\n"
+            f"       overage_cap, overage_credits_used, overage_enabled, profileid,\n"
+            f"       subscription_tier, total_messages, new_user, email\n"
+            f"FROM (\n"
+            f"  SELECT *, ROW_NUMBER() OVER (\n"
+            f"      PARTITION BY date, userid, upper(client_type)\n"
+            f"      ORDER BY export_ts DESC, src_path DESC\n"
+            f"  ) AS rn\n"
+            f"  FROM {database}.report_facts_raw\n"
+            f")\n"
+            f"WHERE rn = 1"
+        ),
+        # Dedup view for models: the authoritative snapshot for a (date,user,
+        # client) is the latest export's FILE, so we rank by the same key (NOT
+        # including model_name) and keep all model rows from the winning file.
+        # Ranking by the file's (export_ts, src_path) and keeping rn over the
+        # per-file row set would need the file id; instead we pick the winning
+        # (export_ts, src_path) per key from the facts ranking and join.
+        (
+            f"CREATE OR REPLACE VIEW {database}.report_models AS\n"  # nosec B608
+            f"WITH winning AS (\n"
+            f"  SELECT date, userid, upper(client_type) AS client_u,\n"
+            f"         max_by(src_path, (export_ts, src_path)) AS win_src\n"
+            f"  FROM {database}.report_facts_raw\n"
+            f"  GROUP BY date, userid, upper(client_type)\n"
+            f")\n"
+            f"SELECT m.date, m.userid, m.client_type, m.subscription_tier,\n"
+            f"       m.model_name, m.messages\n"
+            f"FROM {database}.report_models_raw m\n"
+            f"JOIN winning w\n"
+            f"  ON m.date = w.date AND m.userid = w.userid\n"
+            f" AND upper(m.client_type) = w.client_u\n"
+            f" AND m.src_path = w.win_src"
+        ),
+    ]
 
 
 # --- Identity mapping (optional) --------------------------------------------
@@ -212,9 +256,10 @@ def render_identity_label_parts(database: str, email_expr: str, enabled: bool) -
     label sites so they stay consistent.
 
     Returned keys:
-      base_user_label / base_identity_join  - for base_user_activity (raw cols)
+      base_user_label / base_identity_join  - for base_user_activity
       dim_user_label  / dim_identity_join   - for user_dim (email_per_user CTE)
-    (model_usage uses base_user_label + base_identity_join via render_model_union.)
+    (model_usage derives its label by LEFT JOIN onto user_dim, so it needs no
+    placeholders of its own.)
     """
     if not enabled:
         return {
@@ -224,12 +269,12 @@ def render_identity_label_parts(database: str, email_expr: str, enabled: bool) -
             "dim_identity_join": "",
         }
     _validate_identifier(database, "database")
-    # The crawler's SerDe can keep the source CSV's surrounding double-quotes
-    # in the userid value (observed: "<guid>", length 38 not 36), while the
-    # Identity Store UserId (idc_user_id) is the bare guid. We therefore strip
-    # any wrapping quotes from the report side of the JOIN with
-    # trim(both '"' ...) - a no-op when the value isn't quoted, so it's safe
-    # for both shapes. The Lambda's distinct-user query applies the identical
+    # Some source rows have historically stored userid with surrounding double
+    # quotes ("<guid>", length 38 not 36), while the Identity Store UserId
+    # (idc_user_id) is the bare guid. We therefore strip any wrapping quotes
+    # from the report side of the JOIN with trim(both '"' ...) - a no-op when
+    # the value isn't quoted, so it's safe either way. The Lambda's
+    # distinct-user query applies the identical
     # normalisation so the persisted map keys match. We only normalise on the
     # JOIN comparison; the userid/user_id output columns are left untouched so
     # the rest of the (internally consistent) views and the DrillUser parameter
@@ -278,6 +323,27 @@ def main() -> int:
     p.add_argument("--workgroup", required=True)
     p.add_argument("--region", required=True)
     p.add_argument(
+        "--normalized-bucket",
+        required=True,
+        help="Bucket where normalize_report_lambda lands the normalized CSVs "
+             "(the Athena results bucket). report_facts / report_models "
+             "external tables are created over it.",
+    )
+    p.add_argument(
+        "--normalized-prefix",
+        default="normalized",
+        help="S3 key prefix (directory) of the normalized output within "
+             "--normalized-bucket. Default: normalized",
+    )
+    p.add_argument(
+        "--tables-only",
+        action="store_true",
+        help="Create ONLY the report_facts / report_models external tables, "
+             "then exit (skip the views). deploy.sh runs this before the "
+             "identity-map Lambda so it can read report_facts, then runs the "
+             "full build afterward.",
+    )
+    p.add_argument(
         "--hash-emails",
         action="store_true",
         help="Hash email values with SHA-256 at the view layer. Use when "
@@ -307,21 +373,32 @@ def main() -> int:
         # this too; this is defence in depth.
         p.error("--hash-emails and --identity-map-bucket are mutually exclusive.")
 
-    glue = boto3.client("glue", region_name=args.region)
     athena = boto3.client("athena", region_name=args.region)
 
-    user_report_cols = get_columns(glue, args.database, "raw_user_report")
-    model_cols = list_model_columns(user_report_cols)
-    email_expr = email_expression(user_report_cols, args.hash_emails)
+    email_expr = email_expression(args.hash_emails)
     print(
-        f"Discovered {len(model_cols)} per-model columns; "
-        f"email column: {'present' if email_expr != 'CAST(NULL AS varchar)' else 'absent'}; "
+        f"email: {'hashed' if args.hash_emails else 'plaintext'}; "
         f"identity mapping: {'ON' if identity_enabled else 'off'}",
         file=sys.stderr,
     )
 
+    # The report_facts / report_models external tables (over the normalized
+    # CSVs the normalize_report_lambda lands) must exist BEFORE the views that
+    # read them, so create them first.
+    for stmt in report_tables_ddl(args.database, args.normalized_bucket,
+                                  args.normalized_prefix):
+        run_athena(athena, stmt, args.workgroup, args.database)
+    print("Created report_facts / report_models external tables.", file=sys.stderr)
+
+    if args.tables_only:
+        # Pre-step (deploy.sh): create just the report tables so the
+        # identity-map Lambda can read report_facts for its distinct-user
+        # query, BEFORE the full view build (which needs identity_map to
+        # already exist). The full invocation runs again without this flag.
+        return 0
+
     # The identity_map external table must exist BEFORE the views that join it,
-    # so create it first when enabled.
+    # so create it next when enabled.
     if identity_enabled:
         for stmt in identity_map_ddl(args.database, args.identity_map_bucket,
                                      args.identity_map_prefix):
@@ -329,15 +406,10 @@ def main() -> int:
         print("Created identity_map external table.", file=sys.stderr)
 
     label_parts = render_identity_label_parts(args.database, email_expr, identity_enabled)
-    model_union = render_model_union(
-        args.database, model_cols, email_expr,
-        label_parts["base_user_label"], label_parts["base_identity_join"],
-    )
 
     for path in sorted(VIEWS_DIR.glob("*.sql")):
         sql = string.Template(path.read_text()).substitute(
             database=args.database,
-            model_union=model_union,
             email_expr=email_expr,
             base_user_label=label_parts["base_user_label"],
             base_identity_join=label_parts["base_identity_join"],

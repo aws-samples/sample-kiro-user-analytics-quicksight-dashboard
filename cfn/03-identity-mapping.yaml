@@ -66,9 +66,11 @@ Parameters:
   KiroLogsBucket:
     Type: String
     Description: >
-      The bucket holding the Kiro User Activity Report (source data). The
-      Lambda's SELECT DISTINCT userid FROM raw_user_report reads objects here
-      via Athena, so the execution role needs read access to it.
+      The bucket holding the Kiro User Activity Report (source data). Retained
+      for the execution-role grant; the Lambda's distinct-user query now reads
+      report_facts (normalized data in the Athena results bucket), so this
+      grant is no longer strictly required but is kept harmless for
+      compatibility.
 
   LambdaCodeS3Key:
     Type: String
@@ -78,8 +80,8 @@ Parameters:
     Type: String
     Default: "cron(30 3 * * ? *)"
     Description: >
-      Daily refresh schedule (UTC). Default 03:30 - after the 03:00 Glue
-      crawler, before the 04:00 SPICE refresh, so the map is fresh for each
+      Daily refresh schedule (UTC). Default 03:30 - after the 03:15 report
+      normalizer, before the 04:00 SPICE refresh, so the map is fresh for each
       day's ingest.
 
 Conditions:
@@ -397,8 +399,11 @@ Resources:
     # checkov:skip=CKV_AWS_116: No DLQ - the daily schedule retries next day and the function fails closed (leaves the prior map); a DLQ adds ops surface without benefit for an idempotent daily refresh.
     Properties:
       FunctionName: !Sub "${ResourcePrefix}-identity-map"
-      Runtime: python3.12
+      Runtime: python3.14
+      Architectures: [arm64]
       Handler: identity_map_lambda.handler
+      # Pages identitystore:ListUsers (streams, never holds the whole
+      # directory), so memory/timeout stay modest even for large directories.
       Timeout: 600
       MemorySize: 256
       ReservedConcurrentExecutions: 1
@@ -419,7 +424,7 @@ Resources:
 
   # ---------------------------------------------------------------------------
   # Daily refresh schedule. Runs the Lambda at 03:30 UTC by default - after the
-  # 03:00 crawler, before the 04:00 SPICE refresh.
+  # 03:15 report normalizer, before the 04:00 SPICE refresh.
   # ---------------------------------------------------------------------------
   RefreshRule:
     Type: AWS::Events::Rule

@@ -77,28 +77,28 @@ def active_user_ids() -> set[str]:
     """Distinct user ids that actually appear in the activity data. We only
     resolve/persist these, never the whole directory.
 
-    We query the crawler-created `raw_user_report` table (column `userid`),
-    NOT the curated `base_user_activity` view, on purpose: build_views.py needs
-    the identity_map table to exist before it can render the views, while this
-    Lambda needs the user ids before build_views runs. Reading the raw table
-    (always present right after the crawler) breaks that ordering cycle. The
-    raw `userid` set is identical to base_user_activity's distinct user_ids -
-    dedup in the view never drops a user, only collapses duplicate rows."""
+    We query the `report_facts` table (column `userid`), NOT the curated
+    `base_user_activity` view, on purpose: build_views.py needs the identity_map
+    table to exist before it can render the views, while this Lambda needs the
+    user ids before that full build runs. deploy.sh creates report_facts first
+    (build_views --tables-only) so this query works, breaking the ordering
+    cycle. The report_facts `userid` set is identical to base_user_activity's
+    distinct user_ids - dedup never drops a user, only collapses rows."""
     athena = boto3.client("athena", region_name=os.environ["ATHENA_REGION"],
                           config=_BOTO_CFG)
     database = os.environ["ATHENA_DATABASE"]
     workgroup = os.environ["ATHENA_WORKGROUP"]
-    # trim(both '"' ...): the crawler's SerDe can keep the source CSV's
-    # surrounding double-quotes as part of the value (observed: userid stored
-    # as "<guid>", length 38 not 36). The Identity Store UserId is the bare
-    # guid, so we strip any wrapping quotes here to match. trim is a no-op on
-    # values that aren't quoted, so this is safe for both shapes. The view-side
-    # JOIN applies the identical normalisation (see build_views.py).
+    # trim(both '"' ...): defensive de-quoting. report_facts is read via
+    # OpenCSVSerDe (quoteChar '"'), which normally strips wrapping quotes, but
+    # some source rows have historically stored userid as "<guid>" (length 38,
+    # not 36). The Identity Store UserId is the bare guid, so we strip any
+    # wrapping quotes to match. trim is a no-op on unquoted values, so it's safe
+    # either way. The view-side JOIN applies the identical normalisation.
     # nosec B608 - `database` is the ATHENA_DATABASE env var set by
     # cfn/03-identity-mapping.yaml from the validated DatabaseName CFN param
     # (AllowedPattern [a-z][a-z0-9_]{0,62}); not user-supplied. Athena DDL/DML
     # has no parameter binding so an f-string is the only option.
-    query = f"SELECT DISTINCT trim(both '\"' from userid) FROM {database}.raw_user_report"  # nosec B608
+    query = f"SELECT DISTINCT trim(both '\"' from userid) FROM {database}.report_facts"  # nosec B608
     qid = athena.start_query_execution(
         QueryString=query,
         QueryExecutionContext={"Database": database},

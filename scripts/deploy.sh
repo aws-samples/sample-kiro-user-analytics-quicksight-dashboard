@@ -172,7 +172,34 @@ fi
 
 echo ">> Account=${ACCOUNT_ID} Region=${REGION} Bucket=${KIRO_LOGS_BUCKET} Prefix='${KIRO_LOGS_PREFIX}'"
 
-# 1) Data layer (AWS Glue + Athena)
+# 1) Data layer (AWS Glue + Athena + report-normalizer Lambda).
+# The normalizer Lambda's code zip must live in the results bucket before the
+# stack can create the function, but the results bucket is created BY this
+# stack - so on a first-ever deploy we deploy once with an empty code key
+# (creates bucket + role, no function), then stage the zip and redeploy with
+# the real key (adds the function). On re-deploys the bucket already exists, so
+# we stage up-front and deploy once.
+RESULTS_BUCKET="${DATA_STACK}-athena-results-${ACCOUNT_ID}-${REGION}"
+echo ">> Packaging report-normalizer Lambda"
+NRM_BUILD_DIR="$(mktemp -d)"
+trap 'rm -rf "${NRM_BUILD_DIR}"' EXIT
+cp "${ROOT}/scripts/normalize_report_lambda.py" "${NRM_BUILD_DIR}/"
+( cd "${NRM_BUILD_DIR}" && zip -q normalize_report_lambda.zip normalize_report_lambda.py )
+# Key by content hash so unchanged code keeps the same key (no needless
+# function update on re-deploy); changed code gets a new key.
+if command -v sha256sum >/dev/null 2>&1; then
+    NRM_SHA="$(sha256sum "${NRM_BUILD_DIR}/normalize_report_lambda.py" | awk '{print $1}')"
+else
+    NRM_SHA="$(shasum -a 256 "${NRM_BUILD_DIR}/normalize_report_lambda.py" | awk '{print $1}')"
+fi
+NRM_KEY="lambda-code/normalize_report_lambda-${NRM_SHA}.zip"
+NRM_CODE_KEY=""
+if aws s3 ls "s3://${RESULTS_BUCKET}/" --region "${REGION}" >/dev/null 2>&1; then
+    aws s3 cp "${NRM_BUILD_DIR}/normalize_report_lambda.zip" \
+        "s3://${RESULTS_BUCKET}/${NRM_KEY}" --region "${REGION}"
+    NRM_CODE_KEY="${NRM_KEY}"
+fi
+
 echo ">> Deploying ${DATA_STACK}"
 aws cloudformation deploy \
     --region "${REGION}" \
@@ -184,86 +211,101 @@ aws cloudformation deploy \
         "KiroLogsPrefix=${KIRO_LOGS_PREFIX}" \
         "KmsKeyArn=${KMS_KEY_ARN}" \
         "DatabaseName=${DATABASE_NAME}" \
-        "WorkgroupName=${WORKGROUP_NAME}"
+        "WorkgroupName=${WORKGROUP_NAME}" \
+        "NormalizerLambdaCodeS3Key=${NRM_CODE_KEY}"
+
+if [[ -z "${NRM_CODE_KEY}" ]]; then
+    echo ">> Staging normalizer zip (first deploy) and re-deploying ${DATA_STACK}"
+    aws s3 cp "${NRM_BUILD_DIR}/normalize_report_lambda.zip" \
+        "s3://${RESULTS_BUCKET}/${NRM_KEY}" --region "${REGION}"
+    aws cloudformation deploy \
+        --region "${REGION}" \
+        --stack-name "${DATA_STACK}" \
+        --template-file "${ROOT}/cfn/01-data-layer.yaml" \
+        --capabilities CAPABILITY_IAM \
+        --parameter-overrides \
+            "KiroLogsBucketName=${KIRO_LOGS_BUCKET}" \
+            "KiroLogsPrefix=${KIRO_LOGS_PREFIX}" \
+            "KmsKeyArn=${KMS_KEY_ARN}" \
+            "DatabaseName=${DATABASE_NAME}" \
+            "WorkgroupName=${WORKGROUP_NAME}" \
+            "NormalizerLambdaCodeS3Key=${NRM_KEY}"
+fi
 
 DATABASE="$(aws cloudformation describe-stacks --region "${REGION}" --stack-name "${DATA_STACK}" \
     --query "Stacks[0].Outputs[?OutputKey=='GlueDatabaseName'].OutputValue" --output text)"
 WORKGROUP="$(aws cloudformation describe-stacks --region "${REGION}" --stack-name "${DATA_STACK}" \
     --query "Stacks[0].Outputs[?OutputKey=='AthenaWorkgroupName'].OutputValue" --output text)"
-
-crawler="${DATA_STACK}-user-report"
+NORMALIZER_LAMBDA="$(aws cloudformation describe-stacks --region "${REGION}" --stack-name "${DATA_STACK}" \
+    --query "Stacks[0].Outputs[?OutputKey=='NormalizerLambdaName'].OutputValue" --output text 2>/dev/null || echo "")"
 
 # 1b) Guard against a reused-prefix / changed-bucket mismatch.
 # Re-running an existing STACK_PREFIX with a different KIRO_LOGS_BUCKET reports
-# "No changes" on the data stack, but the existing `raw_user_report` table
-# keeps its ORIGINAL S3 location: the crawler, finding data under a new bucket
-# path, creates a SEPARATE table (raw_user_report_<hash>) rather than
-# repointing the canonical one. Every view, the identity-map Lambda, and SPICE
-# all read `raw_user_report` (still the old bucket) while the IAM grants are
-# scoped to the new bucket - surfacing later as a cryptic S3 403 /
-# SQL_EXCEPTION. We check the TABLE's location (what queries actually read),
-# not the crawler target (which CFN does update), since the table is the
-# binding signal. Skipped cleanly on a first deploy (table doesn't exist yet).
-table_loc="$(aws glue get-table --region "${REGION}" --database-name "${DATABASE}" \
-    --name raw_user_report --query 'Table.StorageDescriptor.Location' --output text 2>/dev/null || echo "")"
-if [[ -n "${table_loc}" && "${table_loc}" != "None" ]]; then
-    table_bucket="${table_loc#s3://}"
-    table_bucket="${table_bucket%%/*}"
-    if [[ "${table_bucket}" != "${KIRO_LOGS_BUCKET}" ]]; then
-        echo ">> ERROR: stack '${DATA_STACK}' already has data from a different bucket." >&2
-        echo "     raw_user_report points at: ${table_bucket}" >&2
-        echo "     you passed KIRO_LOGS_BUCKET:  ${KIRO_LOGS_BUCKET}" >&2
-        echo "   Re-running an existing prefix with a different bucket reports" >&2
-        echo "   'No changes' but leaves raw_user_report on the original bucket" >&2
-        echo "   (the crawler makes a separate table for the new data), so the" >&2
-        echo "   views and IAM grants fall out of sync. To proceed, either:" >&2
-        echo "     - use the original bucket (KIRO_LOGS_BUCKET=${table_bucket}), or" >&2
-        echo "     - pick a new STACK_PREFIX for a fresh deployment, or" >&2
-        echo "     - tear down (scripts/teardown.sh) and redeploy against the new bucket." >&2
-        exit 1
+# "No changes" on the data stack, so the normalizer Lambda keeps its ORIGINAL
+# RAW_BUCKET env while the IAM grants / passed bucket point elsewhere - the
+# dashboard would then show stale data from the old bucket. We compare the
+# deployed normalizer's RAW_BUCKET (what actually gets read) against the bucket
+# passed now. Skipped cleanly on a first deploy (function doesn't exist yet).
+deployed_raw="$(aws lambda get-function-configuration --region "${REGION}" \
+    --function-name "${DATA_STACK}-normalize-report" \
+    --query 'Environment.Variables.RAW_BUCKET' --output text 2>/dev/null || echo "")"
+if [[ -n "${deployed_raw}" && "${deployed_raw}" != "None" && "${deployed_raw}" != "${KIRO_LOGS_BUCKET}" ]]; then
+    echo ">> ERROR: stack '${DATA_STACK}' is already wired to a different bucket." >&2
+    echo "     normalizer reads RAW_BUCKET: ${deployed_raw}" >&2
+    echo "     you passed KIRO_LOGS_BUCKET:  ${KIRO_LOGS_BUCKET}" >&2
+    echo "   Re-running an existing prefix with a different bucket reports" >&2
+    echo "   'No changes' on the stack, so reads stay on the original bucket." >&2
+    echo "   To proceed, either:" >&2
+    echo "     - use the original bucket (KIRO_LOGS_BUCKET=${deployed_raw}), or" >&2
+    echo "     - pick a new STACK_PREFIX for a fresh deployment, or" >&2
+    echo "     - tear down (scripts/teardown.sh) and redeploy against the new bucket." >&2
+    exit 1
+fi
+
+# 2a) Normalize the raw report. Reads the raw Kiro CSVs from S3 BY HEADER and
+# writes the fixed-schema normalized/facts + normalized/models objects. Runs
+# BEFORE build_views.py so those objects exist when build_views creates
+# the report_facts / report_models external tables). Synchronous so the first
+# dashboard open reads correct data; the stack's daily schedule keeps it fresh.
+# Best-effort: a failure here must not brick the deploy - build_views still
+# creates the (empty) external tables and the daily schedule retries.
+if [[ -n "${NORMALIZER_LAMBDA}" && "${NORMALIZER_LAMBDA}" != "None" ]]; then
+    echo ">> Normalizing raw report (synchronous Lambda invoke)"
+    set +e
+    nrm_err="$(aws lambda invoke --region "${REGION}" \
+        --function-name "${NORMALIZER_LAMBDA}" \
+        --cli-binary-format raw-in-base64-out --payload '{}' \
+        --query 'FunctionError' --output text \
+        "${NRM_BUILD_DIR}/invoke.json" 2>"${NRM_BUILD_DIR}/invoke.stderr")"
+    nrm_rc=$?
+    set -e
+    if [[ ${nrm_rc} -ne 0 || ( -n "${nrm_err}" && "${nrm_err}" != "None" ) ]]; then
+        echo ">> WARNING: normalizer Lambda invoke failed:" >&2
+        cat "${NRM_BUILD_DIR}/invoke.stderr" "${NRM_BUILD_DIR}/invoke.json" 2>/dev/null >&2
+        echo "   Views will be created over (possibly empty) normalized tables;" >&2
+        echo "   the daily schedule will retry. Check the Lambda logs." >&2
+    else
+        echo "   Normalizer result: $(cat "${NRM_BUILD_DIR}/invoke.json")"
     fi
 fi
 
-# 2) Run the user_report crawler so AWS Glue tables exist before we render views.
-# (crawler name set in the mismatch guard above.)
-echo ">> Triggering crawler"
-aws glue start-crawler --region "${REGION}" --name "${crawler}" || true
+# 2a-ii) Create the report_facts / report_models external tables now (before
+# identity mapping), so the identity-map Lambda's SELECT DISTINCT userid FROM
+# report_facts works. The full view build runs again in step 3.
+echo ">> Creating report_facts / report_models external tables"
+python3 "${ROOT}/scripts/build_views.py" \
+    --database "${DATABASE}" \
+    --workgroup "${WORKGROUP}" \
+    --region "${REGION}" \
+    --normalized-bucket "${RESULTS_BUCKET}" \
+    --tables-only
 
-# Wait for the crawler to finish AND verify the last run succeeded.
-# A crawler returns to READY even after FAILED - checking only State leaks
-# silent failures (KMS-encrypted source bucket, missing s3:GetObject, etc.)
-# downstream where the SQL views fail with EntityNotFoundException.
-echo ">> Waiting for ${crawler}"
-while :; do
-    state="$(aws glue get-crawler --region "${REGION}" --name "${crawler}" \
-        --query 'Crawler.State' --output text)"
-    [[ "${state}" == "READY" ]] && break
-    sleep 10
-done
-last_status="$(aws glue get-crawler --region "${REGION}" --name "${crawler}" \
-    --query 'Crawler.LastCrawl.Status' --output text 2>/dev/null || echo "")"
-last_msg="$(aws glue get-crawler --region "${REGION}" --name "${crawler}" \
-    --query 'Crawler.LastCrawl.ErrorMessage' --output text 2>/dev/null || echo "")"
-case "${last_status}" in
-    SUCCEEDED) echo "   ${crawler}: SUCCEEDED" ;;
-    ""|None)   echo "   ${crawler}: no prior runs (first deploy?)" ;;
-    *)
-        echo ">> ${crawler} last run: ${last_status} - ${last_msg}" >&2
-        echo ">> Common causes:" >&2
-        echo "     - bucket policy missing s3:GetObject for the crawler role" >&2
-        echo "     - KMS-encrypted source bucket without kms:Decrypt grant (set KMS_KEY_ARN)" >&2
-        echo "     - Kiro export not yet enabled (run scripts/preflight.sh)" >&2
-        exit 1
-        ;;
-esac
-
-# 2b) Identity mapping (optional). Must run AFTER the crawler (so
-# raw_user_report exists for the Lambda's distinct-user query) and BEFORE
+# 2b) Identity mapping (optional). Must run AFTER the report tables exist (so
+# the Lambda's distinct-user query against report_facts works) and BEFORE
 # build_views.py (so the identity_map CSV exists when build_views creates the
 # external table + join). This deploy-time synchronous population is why real
 # names show up on the FIRST dashboard open; the stack's daily schedule only
 # keeps the map fresh thereafter.
-RESULTS_BUCKET="${DATA_STACK}-athena-results-${ACCOUNT_ID}-${REGION}"
 IDMAP_BUCKET=""
 IDMAP_KEY_ARN=""
 PURGE_IDMAP=""
@@ -367,6 +409,7 @@ python3 "${ROOT}/scripts/build_views.py" \
     --database "${DATABASE}" \
     --workgroup "${WORKGROUP}" \
     --region "${REGION}" \
+    --normalized-bucket "${RESULTS_BUCKET}" \
     "${VIEW_FLAGS[@]+"${VIEW_FLAGS[@]}"}"
 
 # 4) QuickSight S3 access. The QS service role needs ListBucket/GetObject on

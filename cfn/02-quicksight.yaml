@@ -559,10 +559,10 @@ Resources:
             - quicksight:UpdateDataSetPermissions
 
   # ---------------------------------------------------------------------------
-  # Daily SPICE refresh schedules. All run at ~04:00 UTC, an hour
-  # after the AWS Glue crawler (which runs an hour after Kiro's 02:00
-  # UTC export). Schedules are staggered by 5 minutes so a single
-  # Athena spike doesn't hit the workgroup all at once.
+  # Daily SPICE refresh schedules. All run at ~04:00 UTC, after the
+  # report-normalizer Lambda (03:15 UTC) and identity-map refresh (03:30 UTC),
+  # which themselves run after Kiro's 02:00 UTC export. Schedules are staggered
+  # by 5 minutes so a single Athena spike doesn't hit the workgroup all at once.
   # ---------------------------------------------------------------------------
   BaseRefreshSchedule:
     Type: AWS::QuickSight::RefreshSchedule

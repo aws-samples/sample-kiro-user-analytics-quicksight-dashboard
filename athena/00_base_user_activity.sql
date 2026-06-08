@@ -1,49 +1,32 @@
--- Curated base view over the Kiro user_report.
--- Verified against sample: KIRO_IDE_<acct>_user_report_<ts>.csv (May 2026).
--- Sample columns (in order):
---   Date, UserId, Client_Type, Chat_Conversations, Credits_Used, Overage_Cap,
---   Overage_Credits_Used, Overage_Enabled, ProfileId, Subscription_Tier,
---   Total_Messages, <model>_messages..., New_User
+-- Curated base view over the normalized Kiro user report.
 --
--- `email` is documented for post–April 2026 exports but is NOT present in
--- this sample, so we read it via TRY/COALESCE and tolerate its absence.
+-- Source: report_facts, the fixed-schema table that normalize_report_lambda
+-- builds by reading the raw Kiro CSVs BY HEADER. Reading the raw export
+-- directly used a POSITIONAL Glue table whose middle columns drift as Kiro
+-- adds models / toggles the trailing New_User column, which corrupted
+-- new_user and the per-model split. report_facts carries only the stable
+-- scalar columns in a fixed order, so this view is immune to that drift.
 --
--- Deduplication: customers with re-runs, multi-region exports, or backfill
--- overlap will see multiple rows for the same (user_id, date, client_type).
--- We keep the row from the lexically-latest file path (Athena's path
--- pseudo-column = the S3 URI), which matches "most recent export" given the
--- timestamp suffix in the filename.
-
--- Note: user_label is exposed so the User-detail sheet can filter `base`
--- against the DrillUser parameter (which holds a label, not a UUID). We
--- can't join to user_dim here because user_dim is downstream - instead
--- the label is computed inline (same logic as user_dim).
+-- Deduplication is already done in the Lambda (latest export wins per
+-- date,user,client), so there is no $$path dedup here.
+--
+-- `email` is always present in report_facts (blank when the source export
+-- predates the April-2026 email column), so ${email_expr} resolves to the
+-- column ref (or its sha256 hash when HashEmails is on).
 --
 -- ${base_user_label} / ${base_identity_join} are rendered by build_views.py:
 --   • identity mapping OFF: label = email-or-uuid, join = empty.
 --   • identity mapping ON:  label = display_name -> email -> username -> uuid,
 --     join = LEFT JOIN identity_map im ON im.idc_user_id = userid.
--- The exact same expression is rendered into user_dim and model_usage so all
--- three label sites agree (the DrillUser parameter depends on that).
+-- The exact same expression is rendered into user_dim so the label sites agree
+-- (the DrillUser parameter depends on that).
 CREATE OR REPLACE VIEW ${database}.base_user_activity AS
-WITH deduped AS (
-    SELECT *,
-           ROW_NUMBER() OVER (
-               PARTITION BY userid, date, client_type
-               ORDER BY "$$path" DESC
-           ) AS dedupe_rn
-    FROM ${database}.raw_user_report
-)
 SELECT
     CAST(date AS date)                                AS activity_date,
     userid                                            AS user_id,
-    -- email column added April 2026; absent in older exports - tolerate.
     COALESCE(${email_expr}, '')                       AS email,
-    -- user_label: see header note; identical expression to user_dim so the
-    -- DrillUser parameter resolves across views.
     ${base_user_label}                                AS user_label,
     upper(client_type)                                AS client_type,
-    -- Sample shows tier as upper snake (PRO_PLUS); normalize for display.
     CASE upper(COALESCE(subscription_tier, ''))
         WHEN 'PRO'      THEN 'Pro'
         WHEN 'PRO_PLUS' THEN 'Pro+'
@@ -54,9 +37,7 @@ SELECT
     -- Per-user constant tier: a single tier per user across the whole window,
     -- so the All-users table can group by user_label and show one row even
     -- when a user changed tier mid-period (e.g. Pro -> Pro+). MAX over the raw
-    -- upper-snake value picks 'PRO_PLUS' over 'PRO' (same rule as user_dim),
-    -- i.e. the upgraded/highest tier wins. Metrics still SUM across whatever
-    -- tier(s) the user held in the selected range.
+    -- upper-snake value picks 'PRO_PLUS' over 'PRO' (same rule as user_dim).
     CASE upper(MAX(COALESCE(subscription_tier, '')) OVER (PARTITION BY userid))
         WHEN 'PRO'      THEN 'Pro'
         WHEN 'PRO_PLUS' THEN 'Pro+'
@@ -72,6 +53,5 @@ SELECT
     COALESCE(TRY(CAST(overage_cap        AS double)), 0.0)  AS overage_cap,
     COALESCE(TRY(CAST(overage_credits_used AS double)), 0.0) AS overage_credits_used,
     COALESCE(TRY(CAST(overage_enabled    AS boolean)), false) AS overage_enabled
-FROM deduped
-${base_identity_join}
-WHERE dedupe_rn = 1;
+FROM ${database}.report_facts
+${base_identity_join};

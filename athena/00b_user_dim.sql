@@ -2,9 +2,13 @@
 -- Other views join this instead of user_totals so the email/label logic is
 -- defined once.
 --
+-- Source: report_facts (the header-normalized table from
+-- normalize_report_lambda), not the raw export - so the email/tier columns are
+-- read by name, never by drifting position.
+--
 -- Email handling:
---   • If the source export has no email column, ${email_expr} is NULL and
---     user_label falls back to user_id.
+--   • report_facts always has an `email` column (blank when the source export
+--     predates it), so ${email_expr} resolves to the column ref.
 --   • If HashEmails is on, ${email_expr} is sha256(email) - PII does not
 --     land in SPICE. Set via the HashEmails CFN parameter; deploy.sh wires the
 --     hash expression at view-render time.
@@ -22,7 +26,7 @@ WITH email_per_user AS (
         -- One representative email per user - the most-recent non-empty one.
         MAX(${email_expr})                     AS email,
         MAX(subscription_tier)                 AS subscription_tier_raw
-    FROM ${database}.raw_user_report
+    FROM ${database}.report_facts
     GROUP BY userid
 )
 SELECT

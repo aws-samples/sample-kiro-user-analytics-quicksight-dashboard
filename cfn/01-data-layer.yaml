@@ -1,9 +1,10 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  Kiro User Analytics - Data layer (AWS Glue + Athena).
-  Crawls the Kiro User Activity Report exported by Kiro to a customer-owned
-  S3 bucket, registers it as a AWS Glue table, and creates an Athena workgroup
-  with a dedicated results bucket.
+  Kiro User Analytics - Data layer (AWS Glue + Athena). Provisions a Glue
+  database, an Athena workgroup with a dedicated results bucket, and a
+  report-normalizer Lambda that reads the Kiro User Activity Report CSVs by
+  header and writes a fixed-schema normalized copy (build_views.py registers
+  Athena external tables over it).
 
 Parameters:
   KiroLogsBucketName:
@@ -33,23 +34,34 @@ Parameters:
     Type: String
     Default: kiro_analytics
 
-  CrawlerSchedule:
-    Type: String
-    Default: "cron(0 3 * * ? *)"
-    Description: >
-      Cron schedule for the AWS Glue crawlers (UTC). Default 03:00 UTC, one hour
-      after the Kiro export at 02:00 UTC.
-
   KmsKeyArn:
     Type: String
     Default: ""
     Description: >
       Optional KMS key ARN that encrypts the Kiro logs bucket. When set, the
-      crawler role is granted kms:Decrypt on this key. Leave blank for
-      SSE-S3-only buckets (no extra grant needed).
+      report-normalizer Lambda role is granted kms:Decrypt on this key. Leave
+      blank for SSE-S3-only buckets (no extra grant needed).
+
+  NormalizerLambdaCodeS3Key:
+    Type: String
+    Default: ""
+    Description: >
+      S3 key of the normalize_report_lambda deployment zip staged in the
+      Athena results bucket by deploy.sh. Leave blank only on the very first
+      stack create before the zip is uploaded (deploy.sh stages the zip and
+      then updates the stack with the real key).
+
+  NormalizeSchedule:
+    Type: String
+    Default: "cron(15 3 * * ? *)"
+    Description: >
+      Daily schedule (UTC) for the report-normalizer Lambda. Default 03:15 -
+      the Kiro export (02:00 UTC) and before the 03:30 identity-map / 04:00
+      SPICE refreshes, so normalized data is current for each day's ingest.
 
 Conditions:
   HasKmsKey: !Not [!Equals [!Ref KmsKeyArn, ""]]
+  HasNormalizerCode: !Not [!Equals [!Ref NormalizerLambdaCodeS3Key, ""]]
 
 Resources:
 
@@ -94,10 +106,23 @@ Resources:
         Status: Enabled
       LifecycleConfiguration:
         Rules:
+          # Scope expiry to query-results/ ONLY. The normalized/ prefix holds
+          # the persistent, date-partitioned facts/models the dashboard reads -
+          # it must NOT expire. (Old query scratch is transient; 30 days is
+          # plenty.) An unscoped rule here would silently delete normalized
+          # partitions older than 30 days.
           - Id: ExpireQueryResults
             Status: Enabled
+            Prefix: query-results/
             ExpirationInDays: 30
             NoncurrentVersionExpirationInDays: 7
+          # Normalized parts are retained, but keep noncurrent versions from
+          # accumulating forever (each daily re-write of a partition part makes
+          # the prior a noncurrent version).
+          - Id: ExpireNormalizedNoncurrent
+            Status: Enabled
+            Prefix: normalized/
+            NoncurrentVersionExpirationInDays: 30
 
   # ---------------------------------------------------------------------------
   # Bucket policy on the Athena results bucket - deny all non-TLS access.
@@ -140,174 +165,6 @@ Resources:
         Description: Kiro user activity analytics
 
   # ---------------------------------------------------------------------------
-  # IAM role for the AWS Glue crawler. Trust policy restricts AssumeRole to
-  # the AWS Glue service principal. Permissions are granted via two scoped
-  # inline policies (no AWS-managed policy is attached - the typical
-  # AWSGlueServiceRole grants glue:* on all resources, which violates least
-  # privilege for a single-database crawler).
-  #
-  # The crawler needs:
-  #   1. Catalog: read+write on this specific database, its tables, and its
-  #      partitions only - so it can register the user_report table and
-  #      update its schema on each run.
-  #   2. Source data: read on the Kiro logs bucket so it can list keys and
-  #      sample CSV objects to infer schema.
-  #   3. Logging: write to /aws-glue/crawlers in CloudWatch Logs so AWS Glue
-  #      can publish per-run logs the customer can inspect when a crawl
-  #      fails.
-  #   4. Metrics: cloudwatch:PutMetricData (resource-scoped via Condition to
-  #      the AWS/Glue namespace) so the crawler can emit run metrics.
-  #   5. Optional KMS: kms:Decrypt on the customer-supplied KMS key, only
-  #      when KMS_KEY_ARN is set (the source bucket is SSE-KMS).
-  #
-  # Capabilities NOT granted that AWSGlueServiceRole would have allowed:
-  # glue:* on all resources, EC2 / VPC, IAM listing, ListAllMyBuckets,
-  # cross-bucket s3:* on aws-glue-*, ec2:*Tags. None apply to this crawler.
-  # ---------------------------------------------------------------------------
-  GlueCrawlerRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal: { Service: glue.amazonaws.com }
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: GlueCatalogRW
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              # Catalog handle - the crawler needs to know the catalog exists
-              # before it can resolve the database under it. Catalog is a
-              # singleton per account/region; the resource ARN is fixed.
-              - Sid: CatalogHandle
-                Effect: Allow
-                Action: glue:GetCatalogImportStatus
-                Resource: !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
-              # Database read+write scoped to OUR database. Crawlers update
-              # the database's last-access metadata even when they only
-              # touch tables, so UpdateDatabase is required.
-              - Sid: DatabaseScopedRW
-                Effect: Allow
-                Action:
-                  - glue:GetDatabase
-                  - glue:GetDatabases
-                  - glue:UpdateDatabase
-                Resource:
-                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
-                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${DatabaseName}"
-              # Tables + partitions in OUR database. The crawler creates
-              # raw_user_report on first run and updates its schema +
-              # partitions on subsequent runs.
-              - Sid: TablesAndPartitionsScopedRW
-                Effect: Allow
-                Action:
-                  - glue:GetTable
-                  - glue:GetTables
-                  - glue:CreateTable
-                  - glue:UpdateTable
-                  - glue:DeleteTable
-                  - glue:BatchDeleteTable
-                  - glue:GetPartition
-                  - glue:GetPartitions
-                  - glue:CreatePartition
-                  - glue:UpdatePartition
-                  - glue:DeletePartition
-                  - glue:BatchCreatePartition
-                  - glue:BatchGetPartition
-                  - glue:BatchUpdatePartition
-                  - glue:BatchDeletePartition
-                Resource:
-                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
-                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${DatabaseName}"
-                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${DatabaseName}/*"
-        - PolicyName: ReadKiroLogsBucket
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Sid: ReadSourceBucket
-                Effect: Allow
-                Action:
-                  - s3:GetObject
-                  - s3:GetBucketLocation
-                  - s3:ListBucket
-                Resource:
-                  - !Sub "arn:${AWS::Partition}:s3:::${KiroLogsBucketName}"
-                  - !Sub "arn:${AWS::Partition}:s3:::${KiroLogsBucketName}/*"
-              - !If
-                - HasKmsKey
-                - Sid: DecryptSourceObjects
-                  Effect: Allow
-                  Action:
-                    - kms:Decrypt
-                    - kms:DescribeKey
-                  Resource: !Ref KmsKeyArn
-                - !Ref AWS::NoValue
-        - PolicyName: CrawlerObservability
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              # AWS Glue writes per-crawler logs under /aws-glue/crawlers.
-              # Scoped to that fixed prefix so the role cannot read or write
-              # arbitrary log groups.
-              - Sid: CrawlerLogsWrite
-                Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource:
-                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*"
-                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/*:log-stream:*"
-              # CloudWatch metrics from the crawler. PutMetricData has no
-              # resource-level ARN, so we constrain it via the
-              # cloudwatch:namespace condition to the AWS/Glue namespace
-              # AWS Glue actually emits to.
-              - Sid: PublishGlueMetrics
-                Effect: Allow
-                Action: cloudwatch:PutMetricData
-                Resource: "*"
-                Condition:
-                  StringEquals:
-                    cloudwatch:namespace: AWS/Glue
-
-  # ---------------------------------------------------------------------------
-  # Crawler for the modern user_report (KIRO_IDE / KIRO_CLI / PLUGIN)
-  # ---------------------------------------------------------------------------
-  UserReportCrawler:
-    Type: AWS::Glue::Crawler
-    Properties:
-      Name: !Sub "${AWS::StackName}-user-report"
-      Role: !GetAtt GlueCrawlerRole.Arn
-      DatabaseName: !Ref GlueDatabase
-      TablePrefix: "raw_"
-      Targets:
-        S3Targets:
-          - Path: !Sub "s3://${KiroLogsBucketName}/${KiroLogsPrefix}AWSLogs/${AWS::AccountId}/KiroLogs/user_report/"
-      Schedule:
-        ScheduleExpression: !Ref CrawlerSchedule
-      SchemaChangePolicy:
-        UpdateBehavior: UPDATE_IN_DATABASE
-        DeleteBehavior: LOG
-      # TableLevelConfiguration:1 forces a single table at the prefix root.
-      # Without this, when Kiro adds a new <model>_messages column the crawler
-      # may decide the new files belong to a separate table (raw_user_report_<hash>),
-      # breaking build_views.py which hard-codes the table name.
-      Configuration: |
-        {
-          "Version": 1.0,
-          "CrawlerOutput": {
-            "Partitions": { "AddOrUpdateBehavior": "InheritFromTable" },
-            "Tables":     { "AddOrUpdateBehavior": "MergeNewColumns" }
-          },
-          "Grouping": {
-            "TableGroupingPolicy": "CombineCompatibleSchemas",
-            "TableLevelConfiguration": 6
-          }
-        }
-
-  # ---------------------------------------------------------------------------
   # Athena workgroup - dedicated so cost / query history is isolated.
   # EnforceWorkGroupConfiguration prevents per-query overrides of the result
   # location and encryption. PublishCloudWatchMetricsEnabled emits per-query
@@ -331,11 +188,135 @@ Resources:
           EncryptionConfiguration:
             EncryptionOption: SSE_S3
 
+  # ---------------------------------------------------------------------------
+  # Report-normalizer Lambda. Reads the raw Kiro CSVs BY HEADER and writes a
+  # fixed-schema normalized copy (normalized/facts/, normalized/models/) to the
+  # results bucket. This is what makes ingestion immune to the raw export's
+  # drifting middle columns (the positional crawler misattributed per-model
+  # usage and corrupted new_user). build_views.py registers external tables
+  # over the normalized output; the views read those, not the raw table.
+  #
+  # IAM (least privilege): read-only on the Kiro logs bucket (source), and
+  # read+write ONLY under the normalized/ prefix of the results bucket. No
+  # Glue, no catalog, no wider S3.
+  # ---------------------------------------------------------------------------
+  NormalizerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReadRawWriteNormalized
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadRawExport
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${KiroLogsBucketName}"
+                  - !Sub "arn:${AWS::Partition}:s3:::${KiroLogsBucketName}/*"
+              - Sid: WriteNormalizedOutput
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub "${AthenaResultsBucket.Arn}/normalized/*"
+              - Sid: ListResultsBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt AthenaResultsBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix: "normalized/*"
+        - !If
+          - HasKmsKey
+          - PolicyName: DecryptSourceKms
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref KmsKeyArn
+          - !Ref AWS::NoValue
+        - PolicyName: Logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-normalize-report*"
+
+  NormalizerLambda:
+    Type: AWS::Lambda::Function
+    Condition: HasNormalizerCode
+    # checkov:skip=CKV_AWS_117: Not in a VPC - it calls only public AWS APIs (S3); a VPC would add NAT cost with no security gain.
+    # checkov:skip=CKV_AWS_116: No DLQ - the daily schedule retries next day and the function fails closed (leaves the prior normalized output); a DLQ adds ops surface without benefit for an idempotent daily rebuild.
+    # checkov:skip=CKV_AWS_173: Env vars are non-sensitive bucket/prefix names; default Lambda encryption suffices.
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-normalize-report"
+      Runtime: python3.14
+      Architectures: [arm64]
+      Handler: normalize_report_lambda.handler
+      # The streaming/incremental design processes one file at a time, so
+      # memory is flat regardless of seat count or history depth - observed
+      # peak is ~100 MB even on a full 300-user/120-day backfill, so 256 MB
+      # gives ample headroom. Timeout is generous for the rare full backfill
+      # (first deploy parses all historical files); steady state touches only
+      # the new daily file in a few seconds.
+      Timeout: 900
+      MemorySize: 256
+      ReservedConcurrentExecutions: 1
+      Role: !GetAtt NormalizerLambdaRole.Arn
+      Code:
+        S3Bucket: !Ref AthenaResultsBucket
+        S3Key: !Ref NormalizerLambdaCodeS3Key
+      Environment:
+        Variables:
+          RAW_BUCKET: !Ref KiroLogsBucketName
+          RAW_PREFIX: !Sub "${KiroLogsPrefix}AWSLogs/${AWS::AccountId}/KiroLogs/user_report/"
+          OUT_BUCKET: !Ref AthenaResultsBucket
+          OUT_PREFIX: "normalized"
+
+  NormalizeRule:
+    Type: AWS::Events::Rule
+    Condition: HasNormalizerCode
+    Properties:
+      Name: !Sub "${AWS::StackName}-normalize-daily"
+      ScheduleExpression: !Ref NormalizeSchedule
+      State: ENABLED
+      Targets:
+        - Id: NormalizerLambda
+          Arn: !GetAtt NormalizerLambda.Arn
+
+  NormalizeRulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasNormalizerCode
+    Properties:
+      FunctionName: !Ref NormalizerLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt NormalizeRule.Arn
+
 Outputs:
   GlueDatabaseName:
     Value: !Ref GlueDatabase
     Export:
       Name: !Sub "${AWS::StackName}-GlueDatabaseName"
+  NormalizerLambdaName:
+    Condition: HasNormalizerCode
+    Value: !Ref NormalizerLambda
   AthenaWorkgroupName:
     Value: !Ref AthenaWorkgroup
     Export:
@@ -344,8 +325,6 @@ Outputs:
     Value: !Ref AthenaResultsBucket
     Export:
       Name: !Sub "${AWS::StackName}-AthenaResultsBucket"
-  UserReportCrawlerName:
-    Value: !Ref UserReportCrawler
   KiroLogsBucketName:
     Value: !Ref KiroLogsBucketName
     Export:

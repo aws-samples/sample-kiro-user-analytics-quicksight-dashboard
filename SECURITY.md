@@ -63,11 +63,12 @@ What the CloudFormation templates and the deployment scripts configure by defaul
 | Object ownership | Athena results bucket | `BucketOwnerEnforced` (ACLs disabled) |
 | Versioning | Athena results bucket | Enabled, with non-current expiration lifecycle |
 | Server access logging | Athena results bucket | Opt-in for the customer (CloudTrail covers Athena API events at the account level) |
-| Lifecycle expiration | Athena results bucket | 30 days for query results; 7 days for non-current versions |
+| Lifecycle expiration | Athena results bucket | `query-results/` prefix expires after 30 days (transient query scratch); the `normalized/` prefix is RETAINED (the dashboard's source data) with a 30-day noncurrent-version cap |
 | Athena workgroup enforcement | Athena workgroup | `EnforceWorkGroupConfiguration: true` (per-query overrides denied) |
 | Athena result encryption | Athena workgroup | `EncryptionOption: SSE_S3` |
 | Athena CloudWatch metrics | Athena workgroup | `PublishCloudWatchMetricsEnabled: true` |
-| AWS Glue crawler IAM | Crawler role | Three resource-scoped inline policies; no AWS-managed policy attached |
+| Report-normalizer Lambda IAM | Normalizer role | Resource-scoped inline policies (read raw bucket; read+write the results bucket scoped to `normalized/*`; logs; optional source `kms:Decrypt`); no AWS-managed policy attached |
+| Report-normalizer Lambda | Normalizer Lambda | `ReservedConcurrentExecutions: 1`; fails closed (leaves the previous normalized output in place on any error) |
 | Amazon QuickSight S3 IAM | Inline policy on the QS service role | Resource ARNs scoped to the two buckets the dashboard reads/writes; the QS-console-managed `AWSQuickSightS3Policy` is left untouched |
 | Amazon QuickSight SPICE encryption | Datasets | Service-managed encryption (Enterprise edition default) |
 
@@ -96,7 +97,7 @@ Two solution-managed buckets and one customer-owned bucket are involved.
 - `BucketOwnerEnforced` ownership (S3 ACLs disabled).
 - Versioning enabled.
 - Server access logging is intentionally not configured (opt-in for the customer; CloudTrail covers Athena API events at the account level). The `cfn_nag` W35 / Checkov CKV_AWS_18 finding is suppressed inline with this rationale.
-- Lifecycle: 30-day expiration on query results; 7-day expiration on non-current versions.
+- Lifecycle: the `query-results/` prefix (transient Athena query scratch) expires after 30 days; the `normalized/` prefix (the dashboard's persistent, date-partitioned source data) is retained, with noncurrent versions capped at 30 days. Scoping the expiry to `query-results/` is deliberate - an unscoped rule would silently delete normalized partitions.
 
 **Identity-map bucket** (created by this stack only when `IDENTITY_MAPPING=true`):
 - Holds resolved names/emails (PII), so it is **isolated from the Athena results bucket** and hardened further: SSE-KMS with a dedicated customer-managed key, server access logging enabled (to a dedicated log bucket), versioning, a TLS-only `DenyInsecureTransport` policy, BPA on all four settings, and a noncurrent-version lifecycle.
@@ -105,22 +106,22 @@ Two solution-managed buckets and one customer-owned bucket are involved.
 
 **Kiro logs bucket** (customer-owned, pre-existing):
 - The customer is responsible for bucket-level controls: Public Access Block, encryption, versioning, lifecycle, and the Kiro export service principal's `s3:PutObject` grant.
-- This solution requests only `s3:GetObject`, `s3:GetBucketLocation`, and `s3:ListBucket` on this bucket via the AWS Glue crawler role.
-- If the bucket is encrypted with a customer-managed AWS KMS key, set `KMS_KEY_ARN` so the crawler role is granted `kms:Decrypt` and `kms:DescribeKey` on that specific key. The KMS key policy must also list the crawler role as a principal allowed to use the key.
+- This solution requests only `s3:GetObject` and `s3:ListBucket` on this bucket via the report-normalizer Lambda role.
+- If the bucket is encrypted with a customer-managed AWS KMS key, set `KMS_KEY_ARN` so the normalizer role is granted `kms:Decrypt` on that specific key. The KMS key policy must also list the normalizer role as a principal allowed to use the key.
 
 ### AWS IAM
 
-- The AWS Glue crawler role uses three resource-scoped inline policies. No AWS-managed policy is attached. The trust policy restricts `sts:AssumeRole` to the `glue.amazonaws.com` service principal.
-  - `GlueCatalogRW`: catalog/database/tables/partitions actions limited to this stack's database ARN.
-  - `ReadKiroLogsBucket`: `s3:GetObject` + `s3:GetBucketLocation` + `s3:ListBucket` scoped to the Kiro logs bucket; conditional `kms:Decrypt` + `kms:DescribeKey` on the customer-supplied KMS key.
-  - `CrawlerObservability`: `logs:CreateLogGroup` + `logs:CreateLogStream` + `logs:PutLogEvents` on `/aws-glue/*`; `cloudwatch:PutMetricData` constrained to the `AWS/Glue` namespace via a Condition.
+- The report-normalizer Lambda role uses resource-scoped inline policies. No AWS-managed policy is attached. The trust policy restricts `sts:AssumeRole` to the `lambda.amazonaws.com` service principal.
+  - `ReadRawWriteNormalized`: `s3:GetObject` + `s3:ListBucket` on the Kiro logs bucket (read source); `s3:GetObject` + `s3:PutObject` on the results bucket scoped to the `normalized/*` prefix; `s3:ListBucket` on the results bucket conditioned on `s3:prefix: normalized/*`.
+  - `DecryptSourceKms` (only when `KMS_KEY_ARN` is set): `kms:Decrypt` on that one key.
+  - `Logs`: `logs:CreateLogGroup` + `logs:CreateLogStream` + `logs:PutLogEvents` scoped to the function's own log group.
 - The Amazon QuickSight service role gets an additive inline policy named `KiroAnalyticsQuickSightS3Access`. It does not modify the console-managed `AWSQuickSightS3Policy`, so the Amazon QuickSight console retains ownership of that policy.
 - The inline policy on the QuickSight role contains one `s3:ListAllMyBuckets` statement on `arn:aws:s3:::*`. This action does not support resource-scoped ARNs at the AWS API level; the wildcard reveals only bucket names, not contents, and mirrors the default behavior of the Amazon QuickSight console.
 
 ### AWS Glue
 
 - Tables are created in a dedicated database namespaced by `STACK_PREFIX` so multiple parallel deployments do not collide.
-- The crawler is configured with `TableLevelConfiguration: 6` and `SchemaChangePolicy: UPDATE_IN_DATABASE / DeleteBehavior: LOG`, so new per-model `<model>_messages` columns merge into the existing table instead of producing new tables.
+- The `report_facts_raw` / `report_models_raw` external tables (registered by `build_views.py`) have a fixed, code-authored schema over the normalizer's output, partitioned by `export_date` via partition projection (no dynamic partition registration). The `report_facts` / `report_models` dedup views on top apply latest-export-wins via `ROW_NUMBER()`. Source columns are read by **header name** in the Lambda, not by ordinal, so a drifting raw export (new `<model>_messages` columns, optional trailing `New_User`) cannot misattribute data - and untrusted header text only ever becomes a `model_name` **value**, never a SQL identifier or column name.
 - AWS Glue Data Catalog encryption-at-rest is an account+region-wide setting (`AWS::Glue::DataCatalogEncryptionSettings`), not a per-database property. This stack does not toggle it because doing so would affect every other AWS Glue database in the customer's account. To enable it once per account/region, run:
   ```bash
   aws glue put-data-catalog-encryption-settings --data-catalog-encryption-settings \
@@ -145,14 +146,14 @@ Two solution-managed buckets and one customer-owned bucket are involved.
 
 ### AWS KMS (optional)
 
-- If the Kiro logs bucket is encrypted with a customer-managed AWS KMS key, pass `KMS_KEY_ARN` at deploy time. The AWS Glue crawler role is then granted `kms:Decrypt` and `kms:DescribeKey` scoped to that specific key ARN.
-- The AWS KMS key policy must allow the AWS Glue crawler role principal to use the key. A minimal statement:
+- If the Kiro logs bucket is encrypted with a customer-managed AWS KMS key, pass `KMS_KEY_ARN` at deploy time. The report-normalizer Lambda role is then granted `kms:Decrypt` scoped to that specific key ARN.
+- The AWS KMS key policy must allow the normalizer role principal to use the key. A minimal statement:
   ```json
   {
-    "Sid": "Allow AWS Glue crawler",
+    "Sid": "Allow Kiro report normalizer",
     "Effect": "Allow",
-    "Principal": { "AWS": "arn:aws:iam::<account>:role/<stack-prefix>-data-GlueCrawlerRole-XXXX" },
-    "Action": ["kms:Decrypt", "kms:DescribeKey"],
+    "Principal": { "AWS": "arn:aws:iam::<account>:role/<stack-prefix>-data-NormalizerLambdaRole-XXXX" },
+    "Action": ["kms:Decrypt"],
     "Resource": "*"
   }
   ```
@@ -200,8 +201,8 @@ responsible for those decisions.
 | T-001 | Data interception in transit between Amazon S3, Amazon Athena, and Amazon QuickSight | Implemented as default (TLS 1.2+; `aws:SecureTransport` bucket policy on results bucket) |
 | T-002 | Direct access to the Athena results bucket bypassing Amazon QuickSight | Implemented as default (Block Public Access, TLS-only bucket policy, IAM scoping, 30-day lifecycle) |
 | T-003 | PII (email) exposure to dashboard viewers without authorization | Customer opt-in (`HASH_EMAILS=true` at deploy; RLS guidance in README) |
-| T-004 / T-008 | AWS Glue crawler IAM role over-privileged | Implemented as default (three resource-scoped inline policies; no AWS-managed policy attached) |
-| T-005 | Modification of Athena views or AWS Glue table to point to unauthorized data | Implemented as default (`EnforceWorkGroupConfiguration: true`; IAM separation between crawler and catalog modification) |
+| T-004 / T-008 | Report-normalizer Lambda IAM role over-privileged | Implemented as default (resource-scoped inline policies: read raw bucket, write only `normalized/*`; no AWS-managed policy attached) |
+| T-005 | Modification of Athena views or external tables to point to unauthorized data | Implemented as default (`EnforceWorkGroupConfiguration: true`; fixed code-authored external-table schema; header text becomes data values, never SQL identifiers) |
 | T-006 | Compromised administrator credentials exfiltrating data | Customer responsibility (CloudTrail logging recommended; S3 access logging on the results bucket can be enabled by the customer post-deploy if required) |
 | T-007 | Malicious data injection into the source bucket to manipulate dashboard output | Customer responsibility (source bucket policy controls writers; this solution has read-only access) |
 | T-009 | `s3:ListAllMyBuckets` on wildcard resource in the Amazon QuickSight inline policy | Accepted (AWS API design constraint; reveals only names, not contents) |

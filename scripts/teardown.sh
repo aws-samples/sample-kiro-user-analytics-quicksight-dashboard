@@ -7,7 +7,7 @@
 #   2. Delete the QS stack - datasets and datasource.
 #   3. Empty + delete the Athena results bucket (Retain in the data stack).
 #   4. Force-delete the Athena workgroup (CFN can't drop it while non-empty).
-#   5. Delete the data stack - AWS Glue, crawler.
+#   5. Delete the data stack - AWS Glue database, Athena workgroup, normalizer Lambda.
 #   6. Revoke the buckets from the QS service role's S3 policy.
 #
 # Identity mapping (step 0) is removed FIRST so its daily refresh Lambda stops

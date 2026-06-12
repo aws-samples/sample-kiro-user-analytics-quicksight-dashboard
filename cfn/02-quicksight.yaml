@@ -188,6 +188,45 @@ Resources:
             - quicksight:UpdateDataSetPermissions
 
   # ---------------------------------------------------------------------------
+  # DataSet over user_daily_dense - the gap-filled per-user daily series.
+  # Powers the User-detail daily Messages/Credits bars so no-activity days
+  # render as visible gaps instead of being silently skipped.
+  # ---------------------------------------------------------------------------
+  UserDailyDenseDataSet:
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "${ResourcePrefix}-user-daily-dense"
+      Name: Kiro - User Daily (dense)
+      ImportMode: SPICE
+      PhysicalTableMap:
+        dense:
+          RelationalTable:
+            DataSourceArn: !GetAtt AthenaDataSource.Arn
+            Catalog: AwsDataCatalog
+            Schema: !Ref GlueDatabase
+            Name: user_daily_dense
+            InputColumns:
+              - { Name: user_id,        Type: STRING }
+              - { Name: user_label,     Type: STRING }
+              - { Name: activity_date,  Type: DATETIME }
+              - { Name: total_messages, Type: INTEGER }
+              - { Name: credits_used,   Type: DECIMAL }
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - quicksight:DescribeDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:PassDataSet
+            - quicksight:DescribeIngestion
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DeleteDataSet
+            - quicksight:CreateIngestion
+            - quicksight:CancelIngestion
+            - quicksight:UpdateDataSetPermissions
+
+  # ---------------------------------------------------------------------------
   # DataSet over daily_trends - per-day active users, messages, and
   # credits used. Powers the Activity & Trends sheet lines.
   # ---------------------------------------------------------------------------
@@ -476,45 +515,11 @@ Resources:
             - quicksight:CancelIngestion
             - quicksight:UpdateDataSetPermissions
 
-  # ---------------------------------------------------------------------------
-  # DataSet over cohort_retention - weekly cohort retention curve.
-  # Powers the People sheet retention chart.
-  # ---------------------------------------------------------------------------
-  CohortRetentionDataSet:
-    Type: AWS::QuickSight::DataSet
-    Properties:
-      AwsAccountId: !Ref AWS::AccountId
-      DataSetId: !Sub "${ResourcePrefix}-cohort-retention"
-      Name: Kiro - Cohort Retention
-      ImportMode: SPICE
-      PhysicalTableMap:
-        base:
-          RelationalTable:
-            DataSourceArn: !GetAtt AthenaDataSource.Arn
-            Catalog: AwsDataCatalog
-            Schema: !Ref GlueDatabase
-            Name: cohort_retention
-            InputColumns:
-              - { Name: cohort_month,      Type: DATETIME }
-              - { Name: months_since,      Type: INTEGER }
-              - { Name: subscription_tier, Type: STRING }
-              - { Name: active_users,      Type: INTEGER }
-              - { Name: cohort_size,       Type: INTEGER }
-              - { Name: retention_rate,    Type: DECIMAL }
-      Permissions:
-        - Principal: !Ref QuickSightPrincipalArn
-          Actions:
-            - quicksight:DescribeDataSet
-            - quicksight:DescribeDataSetPermissions
-            - quicksight:PassDataSet
-            - quicksight:DescribeIngestion
-            - quicksight:ListIngestions
-            - quicksight:UpdateDataSet
-            - quicksight:DeleteDataSet
-            - quicksight:CreateIngestion
-            - quicksight:CancelIngestion
-            - quicksight:UpdateDataSetPermissions
-
+  # NOTE: the cohort_retention dataset (and its Athena view) were removed. The
+  # cohort-retention chart needed many months of history to be meaningful and
+  # did not read clearly; the retention/drift signal is covered by the
+  # engagement-segments "Idle" bucket and the week-over-week "at-risk" flag.
+  #
   # NOTE: the engagement_funnel dataset was removed. The People-sheet funnel was
   # reworked from a native funnel chart (reading this SPICE dataset) into three
   # date-range-driven KPI tiles computed from base-user-activity via calculated
@@ -673,19 +678,7 @@ Resources:
         RefreshType: FULL_REFRESH
         ScheduleFrequency: { Interval: DAILY, TimeOfTheDay: "05:00" }
 
-  # ---------------------------------------------------------------------------
-  # Daily refresh - cohort_retention.
-  # ---------------------------------------------------------------------------
-  CohortRefreshSchedule:
-    Type: AWS::QuickSight::RefreshSchedule
-    DependsOn: CohortRetentionDataSet
-    Properties:
-      AwsAccountId: !Ref AWS::AccountId
-      DataSetId: !Sub "${ResourcePrefix}-cohort-retention"
-      Schedule:
-        ScheduleId: daily
-        RefreshType: FULL_REFRESH
-        ScheduleFrequency: { Interval: DAILY, TimeOfTheDay: "04:55" }
+  # (cohort_retention refresh schedule removed alongside its dataset/view.)
 
   # (engagement_funnel refresh schedule removed alongside its dataset - the
   # People funnel is now KPI tiles over base-user-activity.)
@@ -704,6 +697,20 @@ Resources:
         RefreshType: FULL_REFRESH
         ScheduleFrequency: { Interval: DAILY, TimeOfTheDay: "04:50" }
 
+  # ---------------------------------------------------------------------------
+  # Daily refresh - user_daily_dense (gap-filled per-user daily series).
+  # ---------------------------------------------------------------------------
+  UserDailyDenseRefreshSchedule:
+    Type: AWS::QuickSight::RefreshSchedule
+    DependsOn: UserDailyDenseDataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "${ResourcePrefix}-user-daily-dense"
+      Schedule:
+        ScheduleId: daily
+        RefreshType: FULL_REFRESH
+        ScheduleFrequency: { Interval: DAILY, TimeOfTheDay: "04:30" }
+
 Outputs:
   DataSourceArn:
     Value: !GetAtt AthenaDataSource.Arn
@@ -717,5 +724,4 @@ Outputs:
   ModelUsageDataSetArn:       { Value: !GetAtt ModelUsageDataSet.Arn }
   WowMoversDataSetArn:        { Value: !GetAtt WowMoversDataSet.Arn }
   ActivityHeatmapDataSetArn:  { Value: !GetAtt ActivityHeatmapDataSet.Arn }
-  CohortRetentionDataSetArn:  { Value: !GetAtt CohortRetentionDataSet.Arn }
   PeriodComparisonDataSetArn: { Value: !GetAtt PeriodComparisonDataSet.Arn }

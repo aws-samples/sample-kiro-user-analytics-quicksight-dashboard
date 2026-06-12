@@ -36,9 +36,12 @@ SELECT
     END                                               AS subscription_tier,
     -- Per-user constant tier: a single tier per user across the whole window,
     -- so the All-users table can group by user_label and show one row even
-    -- when a user changed tier mid-period (e.g. Pro -> Pro+). MAX over the raw
-    -- upper-snake value picks 'PRO_PLUS' over 'PRO' (same rule as user_dim).
-    CASE upper(MAX(COALESCE(subscription_tier, '')) OVER (PARTITION BY userid))
+    -- when a user changed tier mid-period (e.g. Pro+ -> Power). We use the
+    -- tier from the user's MOST RECENT activity day (max_by tier over date) =
+    -- their CURRENT plan, so an upgrade shows immediately. (A lexical MAX was
+    -- wrong: 'PRO_PLUS' > 'POWER' alphabetically, so an upgrade to Power kept
+    -- showing Pro+.) Same most-recent rule as user_dim.
+    CASE upper(max_by(COALESCE(subscription_tier, ''), date) OVER (PARTITION BY userid))
         WHEN 'PRO'      THEN 'Pro'
         WHEN 'PRO_PLUS' THEN 'Pro+'
         WHEN 'POWER'    THEN 'Power'

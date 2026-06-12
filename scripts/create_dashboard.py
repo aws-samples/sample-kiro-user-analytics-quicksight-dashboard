@@ -28,6 +28,7 @@ NAME = "Kiro User Analytics"
 # full DataSetId at build time. Must match the IDs minted by cfn/02-quicksight.yaml.
 DATASET_SUFFIXES = {
     "base":         "base-user-activity",
+    "dense":        "user-daily-dense",
     "trends":       "daily-trends",
     "users":        "user-totals",
     "tiers":        "tier-breakdown",
@@ -35,7 +36,6 @@ DATASET_SUFFIXES = {
     "movers":       "wow-movers",
     "models":       "model-usage",
     "heatmap":      "activity-heatmap",
-    "cohort":       "cohort-retention",
     "period":       "period-comparison",
 }
 # NOTE: the People engagement funnel was reworked from the native funnel chart
@@ -129,6 +129,30 @@ def _kpi(visual_id: str, title: str, dataset: str, column: str, agg: str = "SUM"
                             "FieldId": f"{visual_id}-v",
                             "Column": {"DataSetIdentifier": dataset, "ColumnName": column},
                             "AggregationFunction": {"SimpleNumericalAggregation": agg},
+                            "FormatConfiguration": _AUTO_NUMBER_FORMAT,
+                        },
+                    }],
+                },
+            },
+        },
+    }
+
+
+def _kpi_calc(visual_id: str, title: str, dataset: str, calc_field: str):
+    """KPI over a pre-aggregated calculated field (e.g. active_days_calc =
+    distinct_count(activity_date)). QS rejects an AggregationFunction on an
+    aggregate calc field, so we omit it. No trend group: the primary value is
+    the field evaluated over the whole selected window (NOT the last day)."""
+    return {
+        "KPIVisual": {
+            "VisualId": visual_id,
+            "Title": {"Visibility": "VISIBLE", "FormatText": {"PlainText": title}},
+            "ChartConfiguration": {
+                "FieldWells": {
+                    "Values": [{
+                        "NumericalMeasureField": {
+                            "FieldId": f"{visual_id}-v",
+                            "Column": {"DataSetIdentifier": dataset, "ColumnName": calc_field},
                             "FormatConfiguration": _AUTO_NUMBER_FORMAT,
                         },
                     }],
@@ -1160,74 +1184,14 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
         for ident, suffix in DATASET_SUFFIXES.items()
     ]
 
-    # ----- Executive sheet (front page) -----------------------------------
-    # 36-column grid. KPI tiles are 12-wide × 4-tall.
-    exec_visuals = [
-        # Active users MUST be a DISTINCT_COUNT of user_id over the window -
-        # NOT a SUM of daily-distinct counts (which would total user-days,
-        # e.g. 2164 instead of ~50). daily_trends is pre-aggregated so the
-        # raw user_id is gone; read `base` (one row per user/day) and let
-        # QS compute the true distinct.
-        _sub(_kpi_sparkline_distinct("xv-users", "Active users", "base", "user_id", "activity_date"),
-             "Distinct users with at least one active day in the selected window."),
-        _sub(_kpi_sparkline("xv-messages", "Messages",     "trends", "total_messages","activity_date"),
-             "Total user->Kiro messages (volume of usage, not cost)."),
-        _sub(_kpi_sparkline("xv-credits",  "Credits used", "trends", "credits_used",  "activity_date"),
-             "Total credits consumed (the billing unit)."),
-        # Seat utilization: fraction of provisioned users active in the
-        # trailing-30d window. AVERAGE(is_active) over engagement_segmentation
-        # (one row per provisioned user). The #1 question for a paid-tool
-        # admin: how much of what we pay for is actually being used. Fixed
-        # trailing-30d window - not driven by the date picker.
-        _sub(_kpi_percent("xv-utilization", "Seat utilization (30d)", "engagement", "is_active"),
-             "Share of provisioned users active at least once in the trailing 30 days. Trailing-30d window - not affected by the date-range picker."),
-        # Provisioned seats = the raw denominator behind Seat utilization:
-        # DISTINCT_COUNT(user_id) over engagement_segmentation (one row per
-        # ever-seen / provisioned user). Pairs with the utilization % so an
-        # admin sees both "how many seats" and "what fraction are active".
-        # Same dataset as utilization, so likewise NOT date-filtered.
-        _sub(_kpi_distinct_count("xv-seats", "Provisioned seats", "engagement", "user_id"),
-             "Total provisioned users (the denominator behind Seat utilization). All-time roster - not affected by the date-range picker."),
-    ]
-    # Five KPI tiles across the 36-col grid (width 7 each: 0/7/14/21/28).
-    # KPI tiles are height 6 (not 4): the sparkline only renders when the tile
-    # has enough vertical room for title + value + the trend line. At height 4
-    # QuickSight drops the sparkline.
-    exec_grid = [
-        ("xv-users",          0, 0,  7, 6),
-        ("xv-messages",       7, 0,  7, 6),
-        ("xv-credits",       14, 0,  7, 6),
-        ("xv-utilization",   21, 0,  7, 6),
-        ("xv-seats",         28, 0,  8, 6),
-    ]
-    next_row = 6
-
-    # Executive is a 30-second status page. KPI tiles cover the headline
-    # "active users / messages / credits"; one trend line for the
-    # finance-call signal (daily overage credits) and one tier-level
-    # comparison (current vs prior 30d). The day-by-day detail charts
-    # ("daily messages by client", etc.) live on the Activity sheet so
-    # Executive stays a single-screen summary.
-    exec_visuals += [
-        _sub(_bar_time_stacked("xv-overage", "Daily overage credits", "trends", "activity_date", "overage_credits_used"),
-             "Total overage credits consumed per day. Sustained increases suggest customers approaching or exceeding plan capacity."),
-        _sub(_period_compare_bar("xv-period",
-                                 "Messages by tier - prior 30d vs current 30d"),
-             "Each tier shows two bars: the prior 30-day window on the left, the current 30-day window on the right. Anchored on the latest export date so the comparison stays meaningful as new data lands."),
-    ]
-    exec_grid += [
-        ("xv-overage",  0, next_row,      36, 8),
-        ("xv-period",   0, next_row + 8,  36, 8),
-    ]
+    # NOTE: there is no Executive summary sheet. It was dropped because it added
+    # little value - naked KPI totals with no targets/benchmarks to read them
+    # against, and the day-by-day trends it summarized already live on the
+    # Activity & Trends sheet. If a summary page is wanted later, it should lead
+    # with judgment (status vs targets - e.g. a seat-utilization gauge with a
+    # target band, overage-vs-cap, adoption trajectory), not raw totals.
 
     sheets = [
-        {
-            "SheetId": "executive",
-            "Name": "Executive",
-            "ContentType": "INTERACTIVE",
-            "Visuals": exec_visuals,
-            "Layouts": [{"Configuration": _grid(exec_grid)}],
-        },
         # ----- Activity & Trends ------------------------------------------
         {
             "SheetId": "activity",
@@ -1306,9 +1270,9 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
         },
 
         # ----- People ----------------------------------------------------
-        # Cohort-level analytics: top-N tables, segmentation, funnel, cohort
-        # retention, week-over-week movers. Per-user drilling lives on the
-        # separate User-detail sheet via the DrillUser parameter.
+        # Cohort-level analytics: top-N tables, segmentation, funnel,
+        # week-over-week movers. Per-user drilling lives on the separate
+        # User-detail sheet via the DrillUser parameter.
         {
             "SheetId": "people",
             "Name": "People",
@@ -1355,53 +1319,13 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
                      "Engagement funnel: users active ≥20 days in the selected range."),
                 _sub(_bar("p-by-model", "Top users (by model)", "models", "user_label", "messages", items_limit=15),
                      "Per-user message count across all models, scoped to the selected date range and Tier picker."),
-                _sub({
-                    "LineChartVisual": {
-                        "VisualId": "p-cohort",
-                        "Title": {"Visibility": "VISIBLE", "FormatText": {"PlainText": "Cohort retention (all-time · 12 most recent cohorts)"}},
-                        "ChartConfiguration": {
-                            "FieldWells": {
-                                "LineChartAggregatedFieldWells": {
-                                    "Category": [{
-                                        "NumericalDimensionField": {
-                                            "FieldId": "p-cohort-d",
-                                            "Column": {"DataSetIdentifier": "cohort", "ColumnName": "months_since"},
-                                        },
-                                    }],
-                                    "Values": [{
-                                        "NumericalMeasureField": {
-                                            "FieldId": "p-cohort-v",
-                                            "Column": {"DataSetIdentifier": "cohort", "ColumnName": "retention_rate"},
-                                            "AggregationFunction": {"SimpleNumericalAggregation": "AVERAGE"},
-                                            # retention_rate is a 0-1 fraction; render as XX.X% on the y-axis.
-                                            "FormatConfiguration": {
-                                                "FormatConfiguration": {
-                                                    "PercentageDisplayFormatConfiguration": {
-                                                        "DecimalPlacesConfiguration": {"DecimalPlaces": 1},
-                                                    },
-                                                },
-                                            },
-                                        },
-                                    }],
-                                    "Colors": [{
-                                        "DateDimensionField": {
-                                            "FieldId": "p-cohort-c",
-                                            "Column": {"DataSetIdentifier": "cohort", "ColumnName": "cohort_month"},
-                                            "DateGranularity": "MONTH",
-                                        },
-                                    }],
-                                },
-                            },
-                            # Limit color series to the 12 most-recent cohort
-                            # months. QS picks based on color order, which for
-                            # a DateDimensionField is chronological; combined
-                            # with the limit this yields the most-recent 12.
-                            "SortConfiguration": {
-                                "ColorItemsLimitConfiguration": {"ItemsLimit": 12},
-                            },
-                        },
-                    },
-                }, "Retention curve per monthly cohort (12 most recent shown). X = months since first active. Y = % of cohort still active. Cohorts span the full export window - not affected by the date-range picker. Tier is sticky to user_dim; users keep their cohort line even if they upgrade tier."),
+                # NOTE: a cohort-retention visual was intentionally removed. It
+                # needs many months of history to be meaningful and did not read
+                # clearly to users; the retention/drift signal is covered more
+                # legibly here by the engagement-segments "Idle" bucket
+                # (seen-before-but-inactive) and the week-over-week movers
+                # "at-risk" flag. The underlying cohort_retention view/dataset
+                # were removed too (see athena/ and cfn/02-quicksight.yaml).
                 # Single movers table with at_risk flag column - replaces the
                 # earlier separate movers + at-risk tables.
                 _sub(_table("p-movers", "Week-over-week movers (fixed 7d vs 7d)",
@@ -1428,10 +1352,9 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
                 ("p-funnel-1",    18, 12, 18,  4),
                 ("p-funnel-8",    18, 16, 18,  3),
                 ("p-funnel-20",   18, 19, 18,  3),
-                # Per-model top users, then cohort retention, then movers.
+                # Per-model top users, then movers.
                 ("p-by-model",     0, 22, 36, 10),
-                ("p-cohort",       0, 32, 36, 10),
-                ("p-movers",       0, 42, 36, 12),
+                ("p-movers",       0, 32, 36, 12),
             ])}],
         },
 
@@ -1527,16 +1450,19 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
                 # Lifetime profile strip (reads `users`/user_totals, drill-
                 # filtered to the selected user via fg-drill-users). This is
                 # the ONLY visual on the sheet that reads `users`; it gives the
-                # lifetime/identity context the windowed KPIs below lack (tier,
-                # first/last active, overage). NOT date-filtered by design - it
-                # is whole-history context, so it stays populated even when the
-                # selected window has no activity for the user. The dimensions
-                # (tier / first-active / last-active / overage-enabled) are the
-                # descriptive fields; the values are lifetime totals (MAX over
-                # the single user_totals row).
+                # lifetime/identity context the windowed KPIs below lack (who
+                # the user is, tier, first/last active, overage). NOT
+                # date-filtered by design - it is whole-history context, so it
+                # stays populated even when the selected window has no activity
+                # for the user. user_label LEADS so the row identifies the user
+                # (resolves to display-name/email when identity mapping is on,
+                # else the user_id UUID); the remaining dimensions (tier /
+                # first-active / last-active) are descriptive; the values are
+                # lifetime totals (MAX over the single user_totals row).
                 _sub(_table("u-profile", "User profile (lifetime)",
                            "users",
-                           dimensions=["subscription_tier",
+                           dimensions=["user_label",
+                                       "subscription_tier",
                                        ("first_active_date", "date"),
                                        ("last_active_date", "date")],
                            values=[
@@ -1545,24 +1471,35 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
                                ("credits_used",         "MAX"),
                                ("overage_credits_used", "MAX"),
                            ]),
-                     "Lifetime context for the selected user (all-time, not affected by the date picker): plan tier, first/last active date, and lifetime active days / messages / credits (incl. overage credits, which are non-zero only if the user has exceeded plan capacity). The KPIs and charts below are scoped to the selected date window."),
+                     "Identity and lifetime context for the selected user (all-time, not affected by the date picker): user (name/email if identity mapping is on, else the user ID), plan tier, first/last active date, and lifetime active days / messages / credits (incl. overage credits, which are non-zero only if the user has exceeded plan capacity). The KPIs and charts below are scoped to the selected date window."),
                 # KPIs read `base` (per-day fact table) so the date picker
-                # filters them. The sparkline series uses activity_date.
-                _sub(_kpi_sparkline("u-msgs",   "Messages",      "base", "total_messages", "activity_date"),
-                     "Messages this user sent in the selected date window. Sparkline shows day-by-day."),
-                _sub(_kpi_sparkline("u-credits","Credits",       "base", "credits_used",   "activity_date"),
-                     "Credit consumption for this user in the selected window. Sparkline shows daily credits."),
+                # filters them. They show the WINDOW TOTAL (sum/distinct over
+                # the whole selected range) - NOT a sparkline. A KPI with a
+                # date TrendGroup makes its primary value the latest trend
+                # period (the last day), which read as "only the last day's
+                # data" rather than the window total. So these are plain totals
+                # with no trend group; the day-by-day view lives in the daily
+                # charts directly below.
+                _sub(_kpi("u-msgs",   "Messages",      "base", "total_messages", "SUM"),
+                     "Total messages this user sent across the selected date window."),
+                _sub(_kpi("u-credits","Credits",       "base", "credits_used",   "SUM"),
+                     "Total credit consumption for this user across the selected window."),
                 # Active days = distinct_count(activity_date) via the
-                # active_days_calc calculated field. base has one row per
-                # (user, day, client_type), so a plain COUNT would double
-                # count a user active on two clients the same day; the
-                # distinct-count calc field avoids that.
-                _sub(_kpi_sparkline_calc("u-days", "Active days", "base", "active_days_calc", "activity_date"),
-                     "Distinct days this user was active in the selected window."),
-                _sub(_bar_time_stacked("u-daily",   "Daily messages",          "base",  "activity_date", "total_messages"),
-                     "Per-day message volume for the selected user."),
-                _sub(_bar_time_stacked("u-credits-line", "Daily credits used", "base",  "activity_date", "credits_used"),
-                     "Per-day credit consumption for the selected user."),
+                # active_days_calc calculated field (pre-aggregated, so no
+                # AggregationFunction). base has one row per (user, day,
+                # client_type), so a plain COUNT would double count a user
+                # active on two clients the same day; the distinct-count calc
+                # field avoids that.
+                _sub(_kpi_calc("u-days", "Active days", "base", "active_days_calc"),
+                     "Distinct days this user was active across the selected window."),
+                # Read `dense` (user_daily_dense) NOT `base`: the dense view
+                # fills no-activity days with zero rows across the user's active
+                # span, so weekends/gaps render as empty bars instead of being
+                # silently skipped (which made sparse usage look continuous).
+                _sub(_bar_time_stacked("u-daily",   "Daily messages",          "dense", "activity_date", "total_messages"),
+                     "Per-day message volume for the selected user. Days with no activity show as gaps, not skipped."),
+                _sub(_bar_time_stacked("u-credits-line", "Daily credits used", "dense", "activity_date", "credits_used"),
+                     "Per-day credit consumption for the selected user. Days with no activity show as gaps, not skipped."),
                 _sub(_pie("u-models", "Model split",               "models", "model_name", "messages"),
                      "How this user's messages are distributed across models."),
             ],
@@ -1672,11 +1609,12 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
     # Tab order shown in the dashboard = order of this list. The sheet blocks
     # above are authored in a convenient order; reorder them here into the
     # intended narrative without moving the (large) literals around:
-    #   Executive -> Activity & Trends -> Economics -> People -> User detail
+    #   Activity & Trends -> Economics -> People -> User detail
     # This keeps the two user-centric sheets (People and the User detail it
     # drills into) adjacent, with the aggregate/trend sheets (Activity,
-    # Economics) grouped before them.
-    _SHEET_ORDER = ["executive", "activity", "economics", "people", "user-detail"]
+    # Economics) grouped before them. (The Executive sheet was removed - see
+    # the note above where the sheets list is built.)
+    _SHEET_ORDER = ["activity", "economics", "people", "user-detail"]
     sheets.sort(key=lambda s: _SHEET_ORDER.index(s["SheetId"]))
 
     people_sheet = next(s for s in sheets if s["SheetId"] == "people")
@@ -1744,8 +1682,6 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
             },
         }
 
-    exec_sheet = next(s for s in sheets if s["SheetId"] == "executive")
-    exec_sheet["ParameterControls"] = _date_controls("exec")
     activity_sheet = next(s for s in sheets if s["SheetId"] == "activity")
     activity_sheet["ParameterControls"] = _date_controls("activity") + [_tier_control("activity"), _model_control("activity")]
     # People sheet gets the date-range picker (so per-user metrics can be
@@ -1754,9 +1690,9 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
     # base-backed visuals (All Users table, segments donut, the three funnel
     # tiles) and the models-backed Top-users-by-model bar - see
     # people_base_visuals and the fg-date/tier-people-base groups below. Only
-    # two People visuals are intentionally NOT date-filtered: cohort retention
-    # (spans all history by definition) and week-over-week movers (fixed
-    # trailing 7d-vs-7d) - both are labeled as fixed-window. The Model picker is
+    # one People visual is intentionally NOT date-filtered: week-over-week
+    # movers (fixed trailing 7d-vs-7d) - labeled as a fixed-window visual. The
+    # Model picker is
     # intentionally omitted - it was misleading on People (only p-by-model reads
     # `models`, so it appeared global but affected one visual); slice by model
     # on Activity (a-models) or User-detail (u-models) instead.
@@ -1827,9 +1763,10 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
     # parameter (SelectedTier, SelectedModel, DateRangeStart/End, DrillUser).
     filter_groups = []
 
-    # Drill filter on the User-detail sheet. Filters the three datasets
-    # that page reads from to the single user picked in the dropdown.
-    for dataset_id in ("users", "base", "models"):
+    # Drill filter on the User-detail sheet. Filters the datasets that page
+    # reads from to the single user picked in the dropdown. `dense` is the
+    # gap-filled per-user daily series behind the daily Messages/Credits bars.
+    for dataset_id in ("users", "base", "models", "dense"):
         filter_groups.append({
             "FilterGroupId": f"fg-drill-{dataset_id}",
             "Filters": [{
@@ -1868,13 +1805,12 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
         ("heatmap",    ["activity"]),
         ("users",      ["people"]),
         ("movers",     ["people"]),
-        # cohort carries subscription_tier and lives on the People sheet. The
-        # segments donut and funnel tiles moved to `base` (date-range driven),
-        # so their tier filtering is handled by fg-tier-people-base instead -
-        # `engagement` and `funnel` are no longer tier-filtered here (the
-        # engagement dataset is still used by the Executive seat-utilization
-        # KPI, which is not tier-filtered by design).
-        ("cohort",     ["people"]),
+        # The segments donut and funnel tiles moved to `base` (date-range
+        # driven), so their tier filtering is handled by fg-tier-people-base
+        # instead - `engagement` and `funnel` are no longer tier-filtered here.
+        # (The `engagement` dataset is currently unreferenced by any visual
+        # since the Executive sheet was removed; it's kept registered for a
+        # possible future exec/adoption page and is harmless.)
         # tiers (tier_breakdown view) is read on Activity for the daily
         # by-client lines/area.
         ("tiers",      ["activity"]),
@@ -1915,20 +1851,22 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
     # Date-range filter, scoped per dataset to the sheets where that dataset
     # is visualized. On People, only the All Users table (p-all-users, which
     # reads `base`) is date-scoped - it's added as a dedicated SELECTED_VISUALS
-    # group below. The other People visuals (segments / funnel / cohort /
-    # movers) keep their own trailing-window logic and are NOT date-filtered.
+    # group below. The other People visuals (segments / funnel / movers) keep
+    # their own trailing-window logic and are NOT date-filtered.
     date_filtered_datasets = [
-        ("trends",  "activity_date", ["executive", "activity"]),
-        # base feeds the Executive "Active users" distinct-count KPI, the
-        # Activity-sheet visuals, User-detail (KPIs + daily lines), and the
-        # Economics sheet (all Economics visuals now read base).
-        ("base",    "activity_date", ["executive", "activity", "user-detail", "economics"]),
+        ("trends",  "activity_date", ["activity"]),
+        # base feeds the Activity-sheet visuals, User-detail (KPIs + daily
+        # lines), and the Economics sheet (all Economics visuals read base).
+        ("base",    "activity_date", ["activity", "user-detail", "economics"]),
+        # dense = gap-filled per-user daily series; only the User-detail daily
+        # Messages/Credits bars read it, so the date picker scopes it there.
+        ("dense",   "activity_date", ["user-detail"]),
         # models feeds Activity (a-models) and User-detail (u-models).
         # People is included so the "Top users (by model)" bar honors the
         # People date picker. People's only `models`-backed visual is
         # p-by-model, so ALL_VISUALS on the People sheet scopes to just it.
-        ("models",  "activity_date", ["executive", "activity", "user-detail", "people"]),
-        ("heatmap", "activity_date", ["executive", "activity"]),
+        ("models",  "activity_date", ["activity", "user-detail", "people"]),
+        ("heatmap", "activity_date", ["activity"]),
         # tier_breakdown carries activity_date and is read by Activity-sheet
         # visuals (a-active / a-messages / a-credits).
         ("tiers",   "activity_date", ["activity"]),
@@ -1963,8 +1901,8 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
     # People base-backed visuals: date-scope the visuals that read `base` (the
     # All Users table and the engagement-segments donut), leaving the remaining
     # trailing-window visuals untouched. Separate group with a SELECTED_VISUALS
-    # scope so the People date picker drives these without affecting
-    # funnel/cohort/movers.
+    # scope so the People date picker drives these without affecting the movers
+    # table.
     people_base_visuals = ["p-all-users", "p-segments",
                            "p-funnel-1", "p-funnel-8", "p-funnel-20"]
     filter_groups.append({

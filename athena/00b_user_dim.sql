@@ -25,7 +25,11 @@ WITH email_per_user AS (
         userid                                 AS user_id,
         -- One representative email per user - the most-recent non-empty one.
         MAX(${email_expr})                     AS email,
-        MAX(subscription_tier)                 AS subscription_tier_raw
+        -- Most-recent tier (the user's CURRENT plan), not a lexical MAX:
+        -- max_by picks the subscription_tier from the user's latest-dated row,
+        -- so an upgrade (e.g. Pro+ -> Power) shows immediately. A plain MAX
+        -- ranked 'PRO_PLUS' above 'POWER' alphabetically and hid upgrades.
+        max_by(subscription_tier, date)        AS subscription_tier_raw
     FROM ${database}.report_facts
     GROUP BY userid
 )

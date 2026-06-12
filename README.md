@@ -20,15 +20,11 @@ For Kiro **cost and seat utilization** questions (per-user spend, idle seats, bi
 
 ![Architecture diagram](./docs/architecture.png)
 
-Kiro writes a daily user activity report to a customer-owned Amazon S3 bucket. An AWS Lambda function reads those CSVs by header and writes a fixed-schema normalized copy (a stable "facts" dataset plus a long-form per-model "messages" dataset), partitioned by export date, back to the results bucket; Amazon Athena partitioned external tables plus dedup views curate that normalized data. Amazon QuickSight datasets import the curated views into SPICE and refresh daily. The published dashboard exposes five sheets - Executive, Activity & Trends, People, Economics, and User detail - with model, tier, and date-range pickers across the sheets.
+Kiro writes a daily user activity report to a customer-owned Amazon S3 bucket. An AWS Lambda function reads those CSVs by header and writes a fixed-schema normalized copy (a stable "facts" dataset plus a long-form per-model "messages" dataset), partitioned by export date, back to the results bucket; Amazon Athena partitioned external tables plus dedup views curate that normalized data. Amazon QuickSight datasets import the curated views into SPICE and refresh daily. The published dashboard exposes four sheets - Activity & Trends, Economics, People, and User detail - with model, tier, and date-range pickers across the sheets.
 
 Reading the raw report by header (rather than crawling it into a positional table) is deliberate: the report's columns drift over time - Kiro adds a new `<model>_messages` column whenever it launches a model, and the trailing `New_User` column is present in some exports and not others - so a positional table misattributes per-model usage and corrupts `new_user`. The normalizer keys every value by its header name, which is immune to that drift.
 
 ## Dashboard preview
-
-### Executive
-
-![Executive sheet](./docs/executive.png)
 
 ### Activity & Trends
 
@@ -50,25 +46,20 @@ Reading the raw report by header (rather than crawling it into a positional tabl
 
 ## Reading the dashboard: date-window behavior
 
-Most visuals respond to the date-range picker, but a few use a **fixed window** by design (period-over-period comparisons and cohort/retention analytics only make sense against a fixed reference). Fixed-window visuals carry their window in the title (e.g. "(30d)", "(fixed 7d vs 7d)", "(all-time)"). The date picker has no effect on them.
+Most visuals respond to the date-range picker, but one uses a **fixed window** by design (the week-over-week movers comparison only makes sense against a fixed reference). Fixed-window visuals carry their window in the title (e.g. "(fixed 7d vs 7d)"). The date picker has no effect on them.
 
 | Visual | Sheet | Window |
 |--------|-------|--------|
-| Active users / Messages / Credits used (KPIs) | Executive | Date picker |
-| Seat utilization (30d) | Executive | **Fixed** trailing 30 days |
-| Messages by tier - prior 30d vs current 30d | Executive | **Fixed** 30d vs prior 30d |
-| Daily overage credits | Executive | Date picker |
 | All Activity & Trends visuals | Activity & Trends | Date picker |
 | All Economics visuals | Economics | Date picker |
 | All users table | People | Date picker |
 | Engagement segments donut | People | Date picker |
 | Engagement funnel tiles (≥1 / ≥8 / ≥20) | People | Date picker |
 | Top users (by model) | People | Date picker |
-| Cohort retention | People | **Fixed** all-time |
 | Week-over-week movers | People | **Fixed** trailing 7d vs prior 7d |
 | All User detail visuals | User detail | Date picker (+ user selection) |
 
-> **Note on the default range:** the date picker defaults to the **last 30 days**, so the picker-driven visuals align out of the box with the fixed-30d tiles (Seat utilization, prior-vs-current 30d). The fixed-window visuals use their own 30d/7d/all-time windows regardless. For a wider default, change the `RollingDate` expression for `DateRangeStart` in `scripts/create_dashboard.py` from `addDateTime(-30, 'DD', ...)` to e.g. `addDateTime(-90, 'DD', ...)`; users can always widen the range with the picker.
+> **Note on the default range:** the date picker defaults to the **last 30 days**. The week-over-week movers table uses its own fixed 7d-vs-7d window regardless. For a wider default, change the `RollingDate` expression for `DateRangeStart` in `scripts/create_dashboard.py` from `addDateTime(-30, 'DD', ...)` to e.g. `addDateTime(-90, 'DD', ...)`; users can always widen the range with the picker.
 
 ## Getting started
 
@@ -197,13 +188,12 @@ aws quicksight describe-dashboard \
 # Expected output: CREATION_SUCCESSFUL
 ```
 
-The five sheets:
+The four sheets:
 
-* **Executive**: KPI sparklines (Active users, Messages, Credits, Seat utilization, Provisioned seats), daily overage credits, and a prior-vs-current 30d comparison by tier. Date-range picker at the top.
 * **Activity & Trends**: Laid out cost → adoption → engagement → model detail. A stacked credits-by-client bar leads as the cost story; an adoption group pairs daily active users by client (clustered) and by tier (stacked) with a narrow new-vs-returning tile; daily messages by client (stacked); and a full-width 100%-stacked "message mix by model" bar showing each model's share of daily messages. All time-series are bars rather than lines so days with no activity read as gaps, not interpolated usage. Active-users-by-client is clustered (distinct users can't be summed across clients); message/credit splits stack cleanly. Date-range, tier, and model pickers (the Tier picker now also filters the model visuals).
 * **Economics**: Users by tier, credit usage by tier (in-plan + overage), credits per user and per message, and a unit-economics table - all scoped to the selected window. Date-range and tier pickers.
-* **People**: Sortable All Users table (one row per user - usage is summed across the selected period even if the user changed tier, with the tier column showing their highest/most-recent tier), engagement segments donut, engagement funnel tiles (≥1 / ≥8 / ≥20 active days), top users by model, monthly cohort retention curve, and a week-over-week movers table with at-risk flag. Click a row in the All Users table to drill into that user on the User detail sheet. Date-range and Tier pickers - the All Users table, engagement-segments donut, funnel tiles, and top-users-by-model are scoped to the selected range, so you can pick a month (e.g. usage that resets on the 1st) and see that period's activity; the cohort retention curve and week-over-week movers keep their own trailing-window logic.
-* **User detail**: Single-user drill-down. A lifetime profile strip at the top (plan tier, first/last active date, overage status, lifetime totals - not date-filtered) gives identity context; below it, messages, credits, and active days for the selected window, plus daily trends and model split. Pick a user from the dropdown or arrive via the People click-through. Date-range and model pickers. (Because the profile is lifetime, the sheet still shows who the user is even if they had no activity in the selected window.)
+* **People**: Sortable All Users table (one row per user - usage is summed across the selected period even if the user changed tier, with the tier column showing their most-recent tier), engagement segments donut, engagement funnel tiles (≥1 / ≥8 / ≥20 active days), top users by model, and a week-over-week movers table with at-risk flag. Click a row in the All Users table to drill into that user on the User detail sheet. Date-range and Tier pickers - the All Users table, engagement-segments donut, funnel tiles, and top-users-by-model are scoped to the selected range, so you can pick a month (e.g. usage that resets on the 1st) and see that period's activity; the week-over-week movers table keeps its own trailing-window logic.
+* **User detail**: Single-user drill-down. A lifetime profile strip at the top identifies the user (name/email when identity mapping is on, else the user ID) with plan tier, first/last active date, and lifetime totals - not date-filtered. Below it, the total messages, credits, and active days for the selected window, plus daily message/credit bars (which show no-activity days as gaps, not skipped) and a model split. Pick a user from the dropdown or arrive via the People click-through. Date-range and model pickers. (Because the profile is lifetime, the sheet still shows who the user is even if they had no activity in the selected window.)
 
 ## How it works
 
@@ -211,7 +201,7 @@ The solution is layered:
 
 1. **Data layer** (`cfn/01-data-layer.yaml`): An AWS Glue database, an Amazon Athena workgroup, an Amazon S3 results bucket, and a **report-normalizer AWS Lambda** (`scripts/normalize_report_lambda.py`). The Lambda reads the raw Kiro CSVs by header and writes fixed-schema output to the results bucket, partitioned by export date: `normalized/facts/export_date=YYYY-MM-DD/` (stable scalar columns, one row per date/user/client) and `normalized/models/export_date=YYYY-MM-DD/` (long form, one row per date/user/client/model/messages). It runs daily at 03:15 UTC, after Kiro's 02:00 UTC export. The Lambda is **streaming and incremental**: it processes one file at a time (so memory is flat regardless of seat count or history depth) and skips files it has already normalized (keyed on the source object + ETag, so a re-exported file is reprocessed automatically). This scales to large fleets - it has been validated at 300 users / 120 days, and steady-state daily runs touch only the new file.
 
-2. **Curated views** (`athena/*.sql`): `scripts/build_views.py` registers two **partitioned** Amazon Athena external tables (`report_facts_raw`, `report_models_raw`) over the normalized parts, using **partition projection** on `export_date` so no partition registration (`MSCK`/`ADD PARTITION`) is ever needed. On top of those it creates two dedup **views** (`report_facts`, `report_models`) that keep only the latest export per date/user/client via `ROW_NUMBER()` (latest-export-wins) - so deduplication happens in SQL at query time, which scales to any history size while the header parsing stays in the Lambda. `base_user_activity` and `user_dim` read `report_facts`; `model_usage` is a straight projection of the long-form `report_models` (no model unpivot needed - the Lambda already melted the per-model columns into rows, so new Kiro models add rows, never columns). Other views compute daily trends (including new vs returning users), per-user totals, tier breakdowns, engagement segmentation, an activity heatmap, cohort retention, period comparison, and week-over-week movers. (The People-sheet engagement funnel is computed in QuickSight from the base view rather than as its own Athena view, so it responds to the date range.)
+2. **Curated views** (`athena/*.sql`): `scripts/build_views.py` registers two **partitioned** Amazon Athena external tables (`report_facts_raw`, `report_models_raw`) over the normalized parts, using **partition projection** on `export_date` so no partition registration (`MSCK`/`ADD PARTITION`) is ever needed. On top of those it creates two dedup **views** (`report_facts`, `report_models`) that keep only the latest export per date/user/client via `ROW_NUMBER()` (latest-export-wins) - so deduplication happens in SQL at query time, which scales to any history size while the header parsing stays in the Lambda. `base_user_activity` and `user_dim` read `report_facts`; `model_usage` is a straight projection of the long-form `report_models` (no model unpivot needed - the Lambda already melted the per-model columns into rows, so new Kiro models add rows, never columns). Other views compute daily trends (including new vs returning users), per-user totals (incl. a gap-filled per-user daily series for the User-detail charts), tier breakdowns, engagement segmentation, an activity heatmap, and week-over-week movers. (The People-sheet engagement funnel is computed in QuickSight from the base view rather than as its own Athena view, so it responds to the date range.)
 
 3. **QuickSight DataSource and DataSets** (`cfn/02-quicksight.yaml`): One Amazon Athena DataSource and 10 SPICE datasets, each with a daily 04:00 UTC refresh schedule.
 
@@ -312,9 +302,9 @@ responsibility model.
 * **Row-Level Security (RLS) is not configured.** Any principal with `quicksight:QueryDashboard` permission sees every user's data. Customer responsibility: configure dashboard permissions in Amazon QuickSight, and add an RLS dataset rule keyed on `subscription_tier` / `user_id` / etc. if per-row scoping is required (see Customization options).
 * **User identities are shown as opaque GUIDs** unless `IDENTITY_MAPPING=true` is set and the users sign in via AWS IAM Identity Center. Customer responsibility: decide whether resolving GUIDs to real names (which pulls personal data into SPICE, possibly across regions) is appropriate for the dashboard's audience. See [Resolving user identities](#resolving-user-identities-optional) and [SECURITY.md](./SECURITY.md#identity-mapping-optional).
 * Pre-April 2026 exports lack the `email` column and per-model `_messages` columns. The build script tolerates their absence; the affected visuals show user IDs or remain empty.
-* Multiple Amazon S3 exports for the same `(user_id, date)` are deduped by keeping the lexically-latest path.
-* **Tier and credits reflect observed *usage*, not the user's current subscription.** Every value (including `subscription_tier`) comes from the Kiro User Activity Report, which records what a user actually did each day. A user who is upgraded (e.g. Pro → Pro+) but has not used Kiro since the change will still appear under their **previous** tier and credit total until their next day of activity is exported. This is expected: the dashboard is a usage analytic, not a billing/entitlement view. For current subscription status, use Kiro's own admin/billing tools.
-* **KPI tiles show the total for the selected date range, with a sparkline trend** - they intentionally do not display a day-over-day comparison or a "latest date" label, which earlier read as the data being stale. To see day-by-day movement, use the Activity & Trends sheet or widen/narrow the date range.
+* Multiple Amazon S3 exports for the same `(user_id, date, client)` are deduped by keeping the most-recent export (the normalizer Lambda stamps each row with its source export, and an Athena view keeps the latest via `ROW_NUMBER()`).
+* **Tier and credits reflect observed *usage*, not a billing/entitlement feed.** Every value (including `subscription_tier`) comes from the Kiro User Activity Report, which records what a user actually did each day. A user's tier is taken from their **most recent** day of activity, so an upgrade (e.g. Pro+ → Power) shows once they next use Kiro - but a user who hasn't used Kiro since changing plans will still show their last-observed tier until their next day of activity is exported. This is expected: the dashboard is a usage analytic. For authoritative current subscription status, use Kiro's own admin/billing tools.
+* **The User-detail KPI tiles show the TOTAL for the selected date range** (messages, credits, active days summed over the whole window) - not a single day. To see day-by-day movement, use the daily bars below them or the Activity & Trends sheet.
 
 ## Encryption at rest
 

@@ -248,6 +248,25 @@ def identity_map_ddl(database: str, bucket: str, prefix: str) -> list[str]:
     return [drop, create]
 
 
+def _identity_map_source(database: str) -> str:
+    """The identity_map side of the join, collapsed to ONE ROW PER idc_user_id.
+
+    The external table's LOCATION is a *prefix*, so any extra object landing
+    under it (a partial write, a manual copy, a second export) would repeat an
+    idc_user_id. Because idc_username / idc_email are grouping columns in
+    user_totals, a duplicated id would fan that user out into multiple rows -
+    each carrying a full copy of their SUM totals. Collapsing here keeps the
+    join 1:1 by construction rather than by luck.
+    """
+    return (
+        f"(SELECT idc_user_id,"
+        f" MAX(idc_username) AS idc_username,"
+        f" MAX(idc_display_name) AS idc_display_name,"
+        f" MAX(idc_email) AS idc_email"
+        f" FROM {database}.identity_map GROUP BY idc_user_id)"
+    )
+
+
 def render_identity_label_parts(database: str, email_expr: str, enabled: bool) -> dict[str, str]:
     """Build the template substitutions that switch user_label between the
     plain (email-or-uuid) and identity-resolved forms, plus the LEFT JOIN
@@ -300,7 +319,7 @@ def render_identity_label_parts(database: str, email_expr: str, enabled: bool) -
             f"NULLIF(im.idc_username, ''), userid)"
         ),
         "base_identity_join": (
-            f"LEFT JOIN {database}.identity_map im "
+            f"LEFT JOIN {_identity_map_source(database)} im "
             f"ON im.idc_user_id = trim(both '\"' from userid)"
         ),
         "dim_user_label": (
@@ -308,7 +327,7 @@ def render_identity_label_parts(database: str, email_expr: str, enabled: bool) -
             "NULLIF(im.idc_username, ''), user_id)"
         ),
         "dim_identity_join": (
-            f"LEFT JOIN {database}.identity_map im "
+            f"LEFT JOIN {_identity_map_source(database)} im "
             f"ON im.idc_user_id = trim(both '\"' from user_id)"
         ),
         # Raw directory join keys, exposed as their own columns (NULLIF so an

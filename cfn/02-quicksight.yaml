@@ -285,6 +285,17 @@ Resources:
       DataSetId: !Sub "${ResourcePrefix}-user-totals"
       Name: Kiro - User Totals
       ImportMode: SPICE
+      # Restricting who can see the identity columns: Row-Level Security hides
+      # ROWS, so to hide a COLUMN - e.g. keep idc_email from most viewers while
+      # leaving their usage visible - use column-level permissions instead.
+      # QuickSight Enterprise only: list the columns and the principals that MAY
+      # see them; everyone else loses those columns. Uncomment and set your own
+      # group/user ARN to enable.
+      #
+      # ColumnLevelPermissionRules:
+      #   - ColumnNames: [idc_email, email]
+      #     Principals:
+      #       - !Sub "arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:group/default/<admins-group>"
       PhysicalTableMap:
         base:
           RelationalTable:

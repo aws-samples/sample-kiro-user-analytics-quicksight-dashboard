@@ -258,8 +258,19 @@ def render_identity_label_parts(database: str, email_expr: str, enabled: bool) -
     Returned keys:
       base_user_label / base_identity_join  - for base_user_activity
       dim_user_label  / dim_identity_join   - for user_dim (email_per_user CTE)
+      dim_idc_username / dim_idc_email      - for user_dim, the raw Identity
+          Center join keys (see below)
     (model_usage derives its label by LEFT JOIN onto user_dim, so it needs no
     placeholders of its own.)
+
+    Identity JOIN KEYS (dim_idc_username / dim_idc_email): user_label alone is a
+    display string (a real name when mapping is on), which cannot be joined
+    against an external roster/subscription export. We therefore also surface
+    the directory username and email as their own columns so admins can map
+    dashboard rows to their own user lists. When mapping is OFF these resolve to
+    typed NULLs so user_dim keeps a STABLE column set in both modes - the
+    QuickSight DataSet declares these columns unconditionally, and a missing
+    column would break SPICE ingestion.
     """
     if not enabled:
         return {
@@ -267,6 +278,8 @@ def render_identity_label_parts(database: str, email_expr: str, enabled: bool) -
             "base_identity_join": "",
             "dim_user_label": "COALESCE(NULLIF(email, ''), user_id)",
             "dim_identity_join": "",
+            "dim_idc_username": "CAST(NULL AS varchar)",
+            "dim_idc_email": "CAST(NULL AS varchar)",
         }
     _validate_identifier(database, "database")
     # Some source rows have historically stored userid with surrounding double
@@ -296,6 +309,10 @@ def render_identity_label_parts(database: str, email_expr: str, enabled: bool) -
             f"LEFT JOIN {database}.identity_map im "
             f"ON im.idc_user_id = trim(both '\"' from user_id)"
         ),
+        # Raw directory join keys, exposed as their own columns (NULLIF so an
+        # empty directory field reads as NULL rather than '').
+        "dim_idc_username": "NULLIF(im.idc_username, '')",
+        "dim_idc_email": "NULLIF(im.idc_email, '')",
     }
 
 
@@ -415,6 +432,8 @@ def main() -> int:
             base_identity_join=label_parts["base_identity_join"],
             dim_user_label=label_parts["dim_user_label"],
             dim_identity_join=label_parts["dim_identity_join"],
+            dim_idc_username=label_parts["dim_idc_username"],
+            dim_idc_email=label_parts["dim_idc_email"],
         )
         print(f"Applying {path.name}", file=sys.stderr)
         # An Athena workgroup query can only carry one statement; split on a

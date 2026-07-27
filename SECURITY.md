@@ -172,10 +172,10 @@ Two solution-managed buckets and one customer-owned bucket are involved.
 
 This section consolidates the security posture of the optional user-identity-mapping feature (`IDENTITY_MAPPING=true`). See also the README [Resolving user identities](./README.md#resolving-user-identities-optional) section.
 
-**What it does.** Resolves the report's opaque `user_id` GUIDs to human names (display name / username / email) by looking each active user up in AWS IAM Identity Center, and joins the result into the dashboard's user labels.
+**What it does.** Resolves the report's opaque `user_id` GUIDs to human names (display name / username / email) by looking each active user up in AWS IAM Identity Center, and joins the result into the dashboard's user labels. It also surfaces the directory **username** and **email** as their own columns (`idc_username`, `idc_email`) on the user-totals dataset, so an admin can map dashboard rows to an external roster or subscription export - the display label alone is not a reliable join key. Both columns are `NULL` when identity mapping is off.
 
 **Personal data implications the customer must weigh:**
-- It pulls **real names and email addresses** into Amazon QuickSight SPICE. This is personal data; treat the dashboard's audience accordingly (consider Row-Level Security and dashboard-permission scoping).
+- It pulls **real names and email addresses** into Amazon QuickSight SPICE - as the user label and, explicitly, as the `idc_username` / `idc_email` columns available to dashboard authors and in dataset exports. This is personal data; treat the dashboard's audience accordingly (consider Row-Level Security and dashboard-permission scoping, and restrict who can author/export).
 - IAM Identity Center can live in a **different AWS Region** than the dashboard (`IDC_REGION`). Resolving names then performs a **cross-region transfer of personal data** into the dashboard region's bucket and SPICE. Confirm this is acceptable under your data-residency obligations before enabling.
 - Mutually exclusive with `HASH_EMAILS` - the deploy script refuses to run with both, since resolving names while hashing email is contradictory and would silently defeat the privacy control.
 

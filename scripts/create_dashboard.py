@@ -1177,7 +1177,21 @@ def _grid(elements: list[tuple[str, int, int, int, int]]):
     }
 
 
-def build_definition(account_id: str, region: str, resource_prefix: str) -> dict:
+def build_definition(account_id: str, region: str, resource_prefix: str,
+                     identity_mapping: bool = False) -> dict:
+    """Assemble the QuickSight Definition.
+
+    `identity_mapping` mirrors the deploy-time IDENTITY_MAPPING setting. The
+    idc_username / idc_email columns exist on the views and datasets in BOTH
+    modes (a stable schema - changing declared columns between modes would break
+    SPICE ingestion when the flag is toggled), but they are only ever POPULATED
+    when identity mapping is on. So we only place them on the user tables when
+    it is on; otherwise they would render as two permanently empty columns.
+    Authors can still add them from the field list either way.
+    """
+    # Identity join keys shown on the user-facing tables only when they can
+    # actually contain data.
+    idc_dims = ["idc_username", "idc_email"] if identity_mapping else []
     decls = [
         {"Identifier": ident,
          "DataSetArn": dataset_arn(account_id, region, f"{resource_prefix}-{suffix}")}
@@ -1294,7 +1308,14 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
                 # DISTINCT_COUNT/COUNT), hence the data-layer constant column.
                 _sub(_table("p-all-users", "All users",
                            "base",
-                           dimensions=["user_label", "user_tier"],
+                           # user_label MUST stay first: the click-through
+                           # Action references this table's d0 FieldId to set
+                           # DrillUser (see the set_parameters_operation below).
+                           # The idc_* join keys follow so an admin can export
+                           # this grid and join it to their own roster - included
+                           # only when identity mapping is on (they would be
+                           # empty columns otherwise).
+                           dimensions=["user_label", *idc_dims, "user_tier"],
                            values=[
                                ("total_messages",       "SUM"),
                                ("chat_conversations",   "SUM"),
@@ -1462,6 +1483,13 @@ def build_definition(account_id: str, region: str, resource_prefix: str) -> dict
                 _sub(_table("u-profile", "User profile (lifetime)",
                            "users",
                            dimensions=["user_label",
+                                       # Directory join keys so this strip
+                                       # carries a key an admin can match
+                                       # against their own roster, not just a
+                                       # display name. Only present when
+                                       # identity mapping is on - they are
+                                       # always NULL otherwise.
+                                       *idc_dims,
                                        "subscription_tier",
                                        ("first_active_date", "date"),
                                        ("last_active_date", "date")],
@@ -2281,11 +2309,19 @@ def main() -> int:
     p.add_argument("--resource-prefix", default="kiro-analytics",
                    help="Prefix used for QuickSight DataSet IDs. Must match "
                         "the ResourcePrefix passed to the QS CFN stack.")
+    p.add_argument("--identity-mapping", action="store_true",
+                   help="Set when IAM Identity Center user mapping is enabled. "
+                        "Adds the idc_username / idc_email join-key columns to "
+                        "the user tables - they are only populated when mapping "
+                        "is on, so without this flag they are omitted rather "
+                        "than shown as empty columns. (The columns still exist "
+                        "on the datasets either way, so authors can add them.)")
     args = p.parse_args()
 
     qs = boto3.client("quicksight", region_name=args.region)
     definition = build_definition(args.account_id, args.region,
-                                  args.resource_prefix)
+                                  args.resource_prefix,
+                                  identity_mapping=args.identity_mapping)
 
     common = dict(account_id=args.account_id, principal_arn=args.principal_arn,
                   theme_arn=args.theme_arn, asset_id=args.asset_id)

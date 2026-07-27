@@ -262,7 +262,7 @@ The deploy invokes the Lambda **synchronously** before building the views, so re
 | `idc_email` | The directory **email address** |
 | `email` | The email from the *Kiro report itself* - often empty; prefer `idc_email` |
 
-Add `idc_username` / `idc_email` to a visual (or to an exported dataset) to join dashboard usage against a subscription/seat export from Kiro. Both are `NULL` for users that identity mapping could not resolve, and `NULL` for every user when `IDENTITY_MAPPING` is off. Note the `email` column is *not* the same field as `idc_email` - see the table above.
+When `IDENTITY_MAPPING=true`, `idc_username` and `idc_email` are shown directly on the People **All users** table and the User-detail **User profile** strip, so you can read or export them without editing a visual. When identity mapping is **off** they would always be empty, so they are omitted from those tables - they still exist on the datasets, so an author can add them from the field list at any time. `idc_*` is also `NULL` for any individual user that identity mapping could not resolve in the directory. Note the `email` column is *not* the same field as `idc_email` - see the table above.
 
 **Finding your Identity Store ID.** It starts with `d-` and is shown on the IAM Identity Center **Settings** page. It is *not* the instance ARN or the `ssoins-...` instance id (those are for a different set of APIs this solution does not use). From the CLI:
 

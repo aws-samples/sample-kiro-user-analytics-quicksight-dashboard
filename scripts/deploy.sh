@@ -581,7 +581,8 @@ python3 "${ROOT}/scripts/create_dashboard.py" \
     --principal-arn "${QS_PRINCIPAL_ARN}" \
     --asset-id "${ASSET_ID}" \
     --resource-prefix "${STACK_PREFIX}" \
-    ${THEME_ARN:+--theme-arn "${THEME_ARN}"}
+    ${THEME_ARN:+--theme-arn "${THEME_ARN}"} \
+    ${IDMAP_BUCKET:+--identity-mapping}
 
 # 6b) When identity mapping is ON, force a SPICE refresh of the datasets whose
 # views resolve user_label. The QS datasets are SPICE import mode, so a view

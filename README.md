@@ -253,6 +253,17 @@ scripts/deploy.sh
 
 The deploy invokes the Lambda **synchronously** before building the views, so real names appear on the **first** dashboard open - there is no 24-hour wait. The daily schedule only keeps the map fresh afterward.
 
+**Mapping dashboard users to your own roster.** `user_label` is a *display* string (a real name once mapping is on), which is not a reliable key for joining to an external list. The **user-totals** dataset therefore also exposes the raw directory keys as their own columns:
+
+| Column | What it is |
+|--------|------------|
+| `user_id` | The IAM Identity Store user UUID (also the Kiro report's `UserId`) |
+| `idc_username` | The directory **username** / sign-in handle (e.g. `jdoe42`) |
+| `idc_email` | The directory **email address** |
+| `email` | The email from the *Kiro report itself* - often empty; prefer `idc_email` |
+
+Add `idc_username` / `idc_email` to a visual (or to an exported dataset) to join dashboard usage against a subscription/seat export from Kiro. Both are `NULL` for users that identity mapping could not resolve, and `NULL` for every user when `IDENTITY_MAPPING` is off. Note the `email` column is *not* the same field as `idc_email` - see the table above.
+
 **Finding your Identity Store ID.** It starts with `d-` and is shown on the IAM Identity Center **Settings** page. It is *not* the instance ARN or the `ssoins-...` instance id (those are for a different set of APIs this solution does not use). From the CLI:
 
 ```bash

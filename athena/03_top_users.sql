@@ -6,6 +6,13 @@ SELECT
     b.user_id,
     d.user_label,
     d.email,
+    -- Identity Center join keys carried through from user_dim so admins can map
+    -- these rows to an external roster / subscription export (user_label is a
+    -- display string, not a reliable join key). NULL when identity mapping is
+    -- off. Both are in the GROUP BY below - they are per-user dimensions from
+    -- the joined user_dim, not aggregates.
+    d.idc_username,
+    d.idc_email,
     d.subscription_tier,
     MAX(b.profile_id)                        AS profile_id,
     MIN(b.activity_date)                     AS first_active_date,
@@ -18,4 +25,5 @@ SELECT
     BOOL_OR(b.overage_enabled)               AS overage_enabled
 FROM ${database}.base_user_activity b
 LEFT JOIN ${database}.user_dim d ON d.user_id = b.user_id
-GROUP BY b.user_id, d.user_label, d.email, d.subscription_tier;
+GROUP BY b.user_id, d.user_label, d.email, d.idc_username, d.idc_email,
+         d.subscription_tier;

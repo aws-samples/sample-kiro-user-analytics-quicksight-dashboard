@@ -37,6 +37,15 @@ SELECT
     user_id,
     NULLIF(email, '')                          AS email,
     ${dim_user_label}                          AS user_label,
+    -- Identity Center join keys, exposed as their own columns so admins can map
+    -- dashboard rows to an external roster / subscription export. user_label is
+    -- only a DISPLAY string (a real name when mapping is on) and is not
+    -- reliably joinable; these are. Both are NULL when identity mapping is off
+    -- (the column set stays stable in both modes - the QuickSight DataSet
+    -- declares them unconditionally). Note `email` above is the KIRO REPORT's
+    -- email (often empty), whereas idc_email comes from the directory.
+    ${dim_idc_username}                        AS idc_username,
+    ${dim_idc_email}                           AS idc_email,
     CASE upper(COALESCE(subscription_tier_raw, ''))
         WHEN 'PRO'      THEN 'Pro'
         WHEN 'PRO_PLUS' THEN 'Pro+'

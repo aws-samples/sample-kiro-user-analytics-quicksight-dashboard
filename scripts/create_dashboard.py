@@ -1325,6 +1325,28 @@ def build_definition(account_id: str, region: str, resource_prefix: str,
                            ],
                            sort_by=("credits_used", "DESC")),
                      "Every user (one row per user; usage summed across the period even if their tier changed), sortable by any column. Scoped to the date range selected above. Click any row to open that user on the User detail sheet."),
+                # Per-user-PER-DAY grid, for exporting and pivoting outside
+                # QuickSight. The All Users table above is one row per user for
+                # the whole range; this one breaks that out by date, which is
+                # what you need to chart or pivot a user's usage over time in a
+                # spreadsheet. Reads `base` rather than the gap-filled `dense`
+                # dataset on purpose: base carries the full metric set (tier,
+                # conversations, overage) and only rows for days a user was
+                # actually active, so an export is not padded with zero rows.
+                # Grouping by (user, date) collapses the per-client rows in base
+                # into one row per user per day.
+                _sub(_table("p-user-daily", "Daily usage by user",
+                           "base",
+                           dimensions=["user_label", ("activity_date", "date"),
+                                       "user_tier"],
+                           values=[
+                               ("total_messages",       "SUM"),
+                               ("chat_conversations",   "SUM"),
+                               ("credits_used",         "SUM"),
+                               ("overage_credits_used", "SUM"),
+                           ],
+                           sort_by=("activity_date", "DESC")),
+                     "One row per user PER DAY for the selected date range - the day-by-day breakdown behind the All users table above. Sorted newest first; click any column header to re-sort. Use the visual's menu (top-right) > Export to CSV to download the grid and pivot it outside QuickSight."),
                 _sub(_pie_count("p-segments", "Engagement segments (selected range)", "base", "segment_calc", "user_id"),
                      "Active users in the selected date range split by intensity: Power (≥20 active days or ≥1000 messages) / Active (≥8 days) / Light (≥1 day). Recomputes as you change the date range above - pick a month to segment that period's users."),
                 # Engagement funnel rendered as three KPI tiles over the
@@ -1365,17 +1387,19 @@ def build_definition(account_id: str, region: str, resource_prefix: str,
                      "Users with the largest absolute change in messages (last 7d vs prior 7d). at_risk = Yes when drop > 50%. Window is fixed at trailing 7d vs prior 7d - not affected by the date-range picker. Tier picker filters which users are listed; the 7d/7d window is computed before the filter applies."),
             ],
             "Layouts": [{"Configuration": _grid([
-                # All-users table leads (what admins come here for).
+                # All-users table leads (what admins come here for), with the
+                # per-day breakdown of the same data directly beneath it.
                 ("p-all-users",    0,  0, 36, 12),
+                ("p-user-daily",   0, 12, 36, 12),
                 # Engagement: segment mix (donut) on the left; the conversion
                 # funnel as three stacked KPI tiles on the right half.
-                ("p-segments",     0, 12, 18, 10),
-                ("p-funnel-1",    18, 12, 18,  4),
-                ("p-funnel-8",    18, 16, 18,  3),
-                ("p-funnel-20",   18, 19, 18,  3),
+                ("p-segments",     0, 24, 18, 10),
+                ("p-funnel-1",    18, 24, 18,  4),
+                ("p-funnel-8",    18, 28, 18,  3),
+                ("p-funnel-20",   18, 31, 18,  3),
                 # Per-model top users, then movers.
-                ("p-by-model",     0, 22, 36, 10),
-                ("p-movers",       0, 32, 36, 12),
+                ("p-by-model",     0, 34, 36, 10),
+                ("p-movers",       0, 44, 36, 12),
             ])}],
         },
 
@@ -1931,7 +1955,10 @@ def build_definition(account_id: str, region: str, resource_prefix: str,
     # trailing-window visuals untouched. Separate group with a SELECTED_VISUALS
     # scope so the People date picker drives these without affecting the movers
     # table.
-    people_base_visuals = ["p-all-users", "p-segments",
+    # This list drives BOTH the date-range and Tier filter groups for the
+    # People sheet's base-backed visuals - a visual omitted here silently
+    # ignores the From/To picker.
+    people_base_visuals = ["p-all-users", "p-user-daily", "p-segments",
                            "p-funnel-1", "p-funnel-8", "p-funnel-20"]
     filter_groups.append({
         "FilterGroupId": "fg-date-people-base",

@@ -1109,6 +1109,89 @@ def _table(visual_id: str, title: str, dataset: str,
     }
 
 
+def _pivot(visual_id: str, title: str, dataset: str,
+           row_col: str, date_col: str, value_col: str,
+           agg: str = "SUM", row_sort_desc_by_value: bool = True):
+    """Pivot table: one ROW per `row_col`, one COLUMN per day of `date_col`,
+    `value_col` aggregated in the cells - i.e. a spreadsheet-style crosstab.
+
+    Use this instead of a flat table when the per-day breakdown should read
+    across rather than down: a flat (user, day) table repeats the user on every
+    date, so 300 users x 30 days is 9,000 rows to scroll, while the pivot is
+    300 rows x 30 columns with the user named once. Row and column totals give
+    the per-user period total and the per-day all-user total for free.
+    """
+    return {
+        "PivotTableVisual": {
+            "VisualId": visual_id,
+            "Title": {"Visibility": "VISIBLE", "FormatText": {"PlainText": title}},
+            "ChartConfiguration": {
+                "FieldWells": {
+                    "PivotTableAggregatedFieldWells": {
+                        "Rows": [{
+                            "CategoricalDimensionField": {
+                                "FieldId": f"{visual_id}-r",
+                                "Column": {"DataSetIdentifier": dataset, "ColumnName": row_col},
+                            },
+                        }],
+                        "Columns": [{
+                            "DateDimensionField": {
+                                "FieldId": f"{visual_id}-c",
+                                "Column": {"DataSetIdentifier": dataset, "ColumnName": date_col},
+                                "DateGranularity": "DAY",
+                            },
+                        }],
+                        "Values": [{
+                            "NumericalMeasureField": {
+                                "FieldId": f"{visual_id}-v",
+                                "Column": {"DataSetIdentifier": dataset, "ColumnName": value_col},
+                                "AggregationFunction": {"SimpleNumericalAggregation": agg},
+                                "FormatConfiguration": _AUTO_NUMBER_FORMAT,
+                            },
+                        }],
+                    },
+                },
+                # Rank rows by their period total (biggest consumers first) and
+                # keep the date columns chronological left-to-right.
+                "SortConfiguration": {
+                    "FieldSortOptions": ([{
+                        "FieldId": f"{visual_id}-r",
+                        "SortBy": {"Column": {
+                            "Direction": "DESC",
+                            "SortBy": {"DataSetIdentifier": dataset, "ColumnName": value_col},
+                            "AggregationFunction": {
+                                "NumericalAggregationFunction": {"SimpleNumericalAggregation": agg},
+                            },
+                        }},
+                    }] if row_sort_desc_by_value else []) + [{
+                        "FieldId": f"{visual_id}-c",
+                        "SortBy": {"Field": {
+                            "FieldId": f"{visual_id}-c",
+                            "Direction": "ASC",
+                        }},
+                    }],
+                },
+                # Row totals = each user's total for the period; column totals =
+                # every user's usage on that day. Both are the numbers an admin
+                # would otherwise compute by hand after exporting.
+                "TotalOptions": {
+                    "RowTotalOptions": {"TotalsVisibility": "VISIBLE",
+                                        "Placement": "END",
+                                        "CustomLabel": "Period total"},
+                    "ColumnTotalOptions": {"TotalsVisibility": "VISIBLE",
+                                           "Placement": "END",
+                                           "CustomLabel": "All users"},
+                },
+                "TableOptions": {
+                    # One metric, so the metric-name header row is noise.
+                    "SingleMetricVisibility": "HIDDEN",
+                    "ToggleButtonsVisibility": "HIDDEN",
+                },
+            },
+        },
+    }
+
+
 def _funnel(visual_id: str, title: str, dataset: str, stage_col: str, value_col: str,
             sort_col: str = "sort_key"):
     """Native FunnelChartVisual. Stages are ordered by `sort_col` ascending
@@ -1325,28 +1408,20 @@ def build_definition(account_id: str, region: str, resource_prefix: str,
                            ],
                            sort_by=("credits_used", "DESC")),
                      "Every user (one row per user; usage summed across the period even if their tier changed), sortable by any column. Scoped to the date range selected above. Click any row to open that user on the User detail sheet."),
-                # Per-user-PER-DAY grid, for exporting and pivoting outside
-                # QuickSight. The All Users table above is one row per user for
-                # the whole range; this one breaks that out by date, which is
-                # what you need to chart or pivot a user's usage over time in a
-                # spreadsheet. Reads `base` rather than the gap-filled `dense`
-                # dataset on purpose: base carries the full metric set (tier,
-                # conversations, overage) and only rows for days a user was
-                # actually active, so an export is not padded with zero rows.
-                # Grouping by (user, date) collapses the per-client rows in base
-                # into one row per user per day.
-                _sub(_table("p-user-daily", "Daily usage by user",
-                           "base",
-                           dimensions=["user_label", ("activity_date", "date"),
-                                       "user_tier"],
-                           values=[
-                               ("total_messages",       "SUM"),
-                               ("chat_conversations",   "SUM"),
-                               ("credits_used",         "SUM"),
-                               ("overage_credits_used", "SUM"),
-                           ],
-                           sort_by=("activity_date", "DESC")),
-                     "One row per user PER DAY for the selected date range - the day-by-day breakdown behind the All users table above. Sorted newest first; click any column header to re-sort. Use the visual's menu (top-right) > Export to CSV to download the grid and pivot it outside QuickSight."),
+                # Per-user daily credits as a CROSSTAB: users down, dates across.
+                # A flat (user, day) table repeats the user on every date - 300
+                # users x 30 days is 9,000 rows to scroll - whereas the pivot is
+                # one row per user with a column per day, which is also the shape
+                # you want when exporting to a spreadsheet. Row totals give each
+                # user's period total; column totals give the all-user daily
+                # spend. Credits is the cell metric (a pivot cell holds one
+                # measure); the All users table above carries the other metrics.
+                # Reads `base` rather than the gap-filled `dense` dataset: base
+                # has rows only for days a user was actually active, so the grid
+                # is not padded with zero columns for idle days.
+                _sub(_pivot("p-user-daily", "Daily credits used (by user)",
+                            "base", "user_label", "activity_date", "credits_used"),
+                     "Credits used per user per day for the selected date range - users down, dates across. Highest-consuming users first; 'Period total' is each user's total for the range and 'All users' is that day's total. Use the visual's menu (top-right) > Export to CSV to download the grid."),
                 _sub(_pie_count("p-segments", "Engagement segments (selected range)", "base", "segment_calc", "user_id"),
                      "Active users in the selected date range split by intensity: Power (≥20 active days or ≥1000 messages) / Active (≥8 days) / Light (≥1 day). Recomputes as you change the date range above - pick a month to segment that period's users."),
                 # Engagement funnel rendered as three KPI tiles over the

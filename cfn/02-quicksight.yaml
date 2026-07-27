@@ -162,6 +162,12 @@ Resources:
               - { Name: user_id,               Type: STRING }
               - { Name: email,                 Type: STRING }
               - { Name: user_label,            Type: STRING }
+              # Identity Center join keys (NULL unless IDENTITY_MAPPING=true) -
+              # let the People "All users" table show/export a key that maps to
+              # an external roster. Declared unconditionally so the schema is
+              # stable in both modes.
+              - { Name: idc_username,          Type: STRING }
+              - { Name: idc_email,             Type: STRING }
               - { Name: client_type,           Type: STRING }
               - { Name: subscription_tier,     Type: STRING }
               - { Name: user_tier,             Type: STRING }

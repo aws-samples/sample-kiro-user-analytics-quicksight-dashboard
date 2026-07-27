@@ -280,6 +280,8 @@ def render_identity_label_parts(database: str, email_expr: str, enabled: bool) -
             "dim_identity_join": "",
             "dim_idc_username": "CAST(NULL AS varchar)",
             "dim_idc_email": "CAST(NULL AS varchar)",
+            "base_idc_username": "CAST(NULL AS varchar)",
+            "base_idc_email": "CAST(NULL AS varchar)",
         }
     _validate_identifier(database, "database")
     # Some source rows have historically stored userid with surrounding double
@@ -310,10 +312,42 @@ def render_identity_label_parts(database: str, email_expr: str, enabled: bool) -
             f"ON im.idc_user_id = trim(both '\"' from user_id)"
         ),
         # Raw directory join keys, exposed as their own columns (NULLIF so an
-        # empty directory field reads as NULL rather than '').
+        # empty directory field reads as NULL rather than ''). Both the base
+        # and dim variants read the same joined identity_map alias `im`; they
+        # are separate keys only because the two views substitute independently.
         "dim_idc_username": "NULLIF(im.idc_username, '')",
         "dim_idc_email": "NULLIF(im.idc_email, '')",
+        "base_idc_username": "NULLIF(im.idc_username, '')",
+        "base_idc_email": "NULLIF(im.idc_email, '')",
     }
+
+
+def split_statements(sql: str) -> list[str]:
+    """Split a .sql file into individual statements for Athena (which accepts
+    only one statement per query).
+
+    We split on a ';' that ENDS A LINE, but only when that ';' is real SQL - a
+    ';' inside a `--` comment is ignored. Naively splitting on ";\\n" silently
+    truncated a view whose *comment* happened to end a line with ';' (e.g.
+    "-- ... (often empty);"), producing a baffling "mismatched input '<EOF>'"
+    parse error. Comment text is prose and must never affect statement
+    boundaries."""
+    statements: list[str] = []
+    current: list[str] = []
+    for line in sql.splitlines():
+        current.append(line)
+        # Strip a trailing line comment before deciding if the line ends a
+        # statement. (String literals in these views never contain '--'.)
+        code = line.split("--", 1)[0].rstrip()
+        if code.endswith(";"):
+            stmt = "\n".join(current).strip()
+            if stmt:
+                statements.append(stmt)
+            current = []
+    tail = "\n".join(current).strip()
+    if tail:
+        statements.append(tail)
+    return statements
 
 
 def run_athena(athena, sql: str, workgroup: str, database: str) -> None:
@@ -434,12 +468,11 @@ def main() -> int:
             dim_identity_join=label_parts["dim_identity_join"],
             dim_idc_username=label_parts["dim_idc_username"],
             dim_idc_email=label_parts["dim_idc_email"],
+            base_idc_username=label_parts["base_idc_username"],
+            base_idc_email=label_parts["base_idc_email"],
         )
         print(f"Applying {path.name}", file=sys.stderr)
-        # An Athena workgroup query can only carry one statement; split on a
-        # bare ';' on its own line so we don't break SQL bodies that contain
-        # semicolons inside expressions.
-        for statement in [s.strip() for s in sql.split(";\n") if s.strip()]:
+        for statement in split_statements(sql):
             run_athena(athena, statement, args.workgroup, args.database)
 
     return 0

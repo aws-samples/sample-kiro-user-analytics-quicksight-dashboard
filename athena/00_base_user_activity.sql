@@ -26,6 +26,13 @@ SELECT
     userid                                            AS user_id,
     COALESCE(${email_expr}, '')                       AS email,
     ${base_user_label}                                AS user_label,
+    -- Identity Center join keys (NULL when identity mapping is off). Exposed
+    -- here as well as on user_dim so the People "All users" table - which reads
+    -- this view - can show/export a key an admin can match against their own
+    -- roster. Note `email` above is the KIRO REPORT's email (often empty),
+    -- whereas idc_email comes from the directory.
+    ${base_idc_username}                              AS idc_username,
+    ${base_idc_email}                                 AS idc_email,
     upper(client_type)                                AS client_type,
     CASE upper(COALESCE(subscription_tier, ''))
         WHEN 'PRO'      THEN 'Pro'

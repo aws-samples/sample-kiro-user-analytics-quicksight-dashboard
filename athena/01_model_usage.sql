@@ -22,13 +22,7 @@ SELECT
     m.userid                                        AS user_id,
     COALESCE(d.user_label, m.userid)                AS user_label,
     upper(m.client_type)                            AS client_type,
-    CASE upper(COALESCE(m.subscription_tier, ''))
-        WHEN 'PRO'      THEN 'Pro'
-        WHEN 'PRO_PLUS' THEN 'Pro+'
-        WHEN 'POWER'    THEN 'Power'
-        WHEN ''         THEN 'Unknown'
-        ELSE m.subscription_tier
-    END                                             AS subscription_tier,
+    ${tier_label_model}                             AS subscription_tier,
     m.model_name                                    AS model_name,
     COALESCE(TRY(CAST(m.messages AS bigint)), 0)    AS messages
 FROM ${database}.report_models m

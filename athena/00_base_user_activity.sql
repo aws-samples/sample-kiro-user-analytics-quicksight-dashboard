@@ -34,13 +34,7 @@ SELECT
     ${base_idc_username}                              AS idc_username,
     ${base_idc_email}                                 AS idc_email,
     upper(client_type)                                AS client_type,
-    CASE upper(COALESCE(subscription_tier, ''))
-        WHEN 'PRO'      THEN 'Pro'
-        WHEN 'PRO_PLUS' THEN 'Pro+'
-        WHEN 'POWER'    THEN 'Power'
-        WHEN ''         THEN 'Unknown'
-        ELSE subscription_tier
-    END                                               AS subscription_tier,
+    ${tier_label_row}                                 AS subscription_tier,
     -- Per-user constant tier: a single tier per user across the whole window,
     -- so the All-users table can group by user_label and show one row even
     -- when a user changed tier mid-period (e.g. Pro+ -> Power). We use the
@@ -48,13 +42,7 @@ SELECT
     -- their CURRENT plan, so an upgrade shows immediately. (A lexical MAX was
     -- wrong: 'PRO_PLUS' > 'POWER' alphabetically, so an upgrade to Power kept
     -- showing Pro+.) Same most-recent rule as user_dim.
-    CASE upper(max_by(COALESCE(subscription_tier, ''), date) OVER (PARTITION BY userid))
-        WHEN 'PRO'      THEN 'Pro'
-        WHEN 'PRO_PLUS' THEN 'Pro+'
-        WHEN 'POWER'    THEN 'Power'
-        WHEN ''         THEN 'Unknown'
-        ELSE subscription_tier
-    END                                               AS user_tier,
+    ${tier_label_user}                                AS user_tier,
     profileid                                         AS profile_id,
     COALESCE(TRY(CAST(new_user AS boolean)), false)   AS new_user,
     COALESCE(TRY(CAST(chat_conversations AS bigint)), 0)    AS chat_conversations,

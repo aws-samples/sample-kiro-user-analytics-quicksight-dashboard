@@ -248,6 +248,68 @@ def identity_map_ddl(database: str, bucket: str, prefix: str) -> list[str]:
     return [drop, create]
 
 
+# Raw subscription_tier value -> display label. The Kiro export emits
+# SCREAMING_SNAKE tier codes; the dashboard shows friendly labels. Kiro has
+# exactly four paid tiers - Pro, Pro+, Pro Max, Power - so this is the complete
+# set for an enterprise subscription. (Free is deliberately absent: it exists
+# only on Builder IDs, and an enterprise can only buy Pro and above, so it
+# cannot appear in this export.) 'Unknown' below covers a blank/missing tier,
+# not a real plan. Keep in sync
+# with _TIER_COLORS in create_dashboard.py, which pins a fixed colour per label
+# (an unlisted label still renders, just from the auto palette).
+_TIER_LABELS = {
+    "PRO": "Pro",
+    "PRO_PLUS": "Pro+",
+    "PRO_MAX": "Pro Max",
+    "POWER": "Power",
+}
+
+
+def tier_label_expr(raw: str) -> str:
+    """A CASE expression mapping a raw tier value to its display label.
+
+    `raw` is the SQL expression holding the raw tier - a plain column
+    (`subscription_tier`) or a window function (`max_by(...) OVER (...)`). It is
+    substituted at EVERY position, including the fallback, which is the whole
+    point: the previous hand-written CASEs ended in `ELSE subscription_tier`,
+    a *different* expression than the one being tested. Two bugs came out of
+    that, both visible as a column mixing 'Pro+' with 'PRO_PLUS':
+
+      1. An unmapped tier (e.g. PRO_MAX, which Kiro added after this was
+         written) fell through to the raw SCREAMING_SNAKE value, so one column
+         showed both styles at once.
+      2. Worse, in the `user_tier` case the CASE tested the per-user windowed
+         tier but the ELSE returned the PER-ROW tier. For a user on an unmapped
+         tier, user_tier stopped being constant per user - which silently broke
+         the one-row-per-user guarantee the All-users table relies on (a user
+         who changed tier mid-window split into several rows, each with a
+         partial share of their totals).
+
+    Rather than only adding the missing WHENs, unknown tiers now get a
+    generic prettifier (PRO_ULTRA -> 'Pro Ultra'), so the next tier Kiro
+    invents renders sensibly on a dashboard nobody has redeployed yet. Empty
+    and NULL both read 'Unknown'.
+    """
+    operand = f"upper(COALESCE({raw}, ''))"
+    whens = "\n".join(
+        f"        WHEN '{code}' THEN '{label}'"
+        for code, label in _TIER_LABELS.items()
+    )
+    # Title-case each '_'-separated word of the raw value: split on the
+    # separator, upper the first letter, lower the rest, re-join with spaces.
+    fallback = (
+        f"array_join(transform(split(replace({operand}, '_', ' '), ' '),"
+        f" w -> upper(substr(w, 1, 1)) || lower(substr(w, 2))), ' ')"
+    )
+    return (
+        f"CASE {operand}\n"
+        f"        WHEN '' THEN 'Unknown'\n"
+        f"{whens}\n"
+        f"        ELSE {fallback}\n"
+        f"    END"
+    )
+
+
 def _identity_map_source(database: str) -> str:
     """The identity_map side of the join, collapsed to ONE ROW PER idc_user_id.
 
@@ -489,6 +551,18 @@ def main() -> int:
             dim_idc_email=label_parts["dim_idc_email"],
             base_idc_username=label_parts["base_idc_username"],
             base_idc_email=label_parts["base_idc_email"],
+            # Tier display labels, rendered from one shared mapping so the four
+            # sites that expose a tier cannot drift apart. Each variant differs
+            # only in the raw expression it wraps:
+            #   *_row  - the per-row tier column
+            #   *_user - the per-user CURRENT tier (most recent activity day)
+            tier_label_row=tier_label_expr("subscription_tier"),
+            tier_label_user=tier_label_expr(
+                "max_by(COALESCE(subscription_tier, ''), date)"
+                " OVER (PARTITION BY userid)"
+            ),
+            tier_label_dim=tier_label_expr("subscription_tier_raw"),
+            tier_label_model=tier_label_expr("m.subscription_tier"),
         )
         print(f"Applying {path.name}", file=sys.stderr)
         for statement in split_statements(sql):

@@ -136,7 +136,9 @@ def report_tables_ddl(database: str, bucket: str, prefix: str) -> list[str]:
             f"    new_user             string,\n"
             f"    email                string,\n"
             f"    src_path             string,\n"
-            f"    export_ts            string\n"
+            f"    export_ts            string,\n"
+            f"    part_id              string,\n"
+            f"    processed_ts         string\n"
             f")\n"
             f"PARTITIONED BY (export_date string)\n"
             f"ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'\n"
@@ -153,7 +155,9 @@ def report_tables_ddl(database: str, bucket: str, prefix: str) -> list[str]:
             f"    model_name        string,\n"
             f"    messages          string,\n"
             f"    src_path          string,\n"
-            f"    export_ts         string\n"
+            f"    export_ts         string,\n"
+            f"    part_id           string,\n"
+            f"    processed_ts      string\n"
             f")\n"
             f"PARTITIONED BY (export_date string)\n"
             f"ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'\n"
@@ -162,9 +166,35 @@ def report_tables_ddl(database: str, bucket: str, prefix: str) -> list[str]:
             f"TBLPROPERTIES (\n{proj.format(loc=models_loc)}\n)"
         ),
         # Dedup view: one fact row per (date,user,client) - the latest export
-        # wins (highest export_ts, then src_path as a tiebreaker). This is the
-        # latest-export-wins rule the old base_user_activity applied via the
-        # "$path" pseudo-column, now done over the partitioned parts.
+        # wins. This is the latest-export-wins rule the old base_user_activity
+        # applied via the "$path" pseudo-column, now done over the partitioned
+        # parts.
+        #
+        # Ordering is (export_ts, processed_ts, part_id), all DESC:
+        #   export_ts    - newest SOURCE export for this key wins (the real rule).
+        #   processed_ts - tiebreak when the same source file was normalized more
+        #                  than once. That happens when Kiro re-exports a file IN
+        #                  PLACE: the part name is sha256(key|ETag), so changed
+        #                  content lands in a NEW part and the old one is
+        #                  orphaned (we never delete from a customer bucket).
+        #                  Both parts carry the same src_path and export_ts, so
+        #                  without processed_ts the rank was a TIE and Athena
+        #                  returned either row - the same query could give
+        #                  different answers on consecutive runs. Preferring the
+        #                  most recently WRITTEN part makes the stale copy
+        #                  unreachable.
+        #   part_id      - final tiebreak so the result is fully deterministic
+        #                  even for two parts written in the same second.
+        #
+        # COALESCE to '' on both new columns: parts written by an OLDER version
+        # of the normalizer predate these columns, so the SerDe reads them as
+        # NULL. That matters twice - NULL sorts unpredictably, and max_by's ROW
+        # key rejects NULL fields outright ("ROW comparison not supported for
+        # fields with null elements"). Mapping NULL to '' makes legacy parts sort
+        # OLDEST, which is exactly right: after an upgrade the re-normalized part
+        # carries a real processed_ts and wins, so a customer who updates this
+        # stack sees the new parts take precedence without anyone deleting the old
+        # ones. (Legacy parts stay readable, just outranked.)
         (
             f"CREATE OR REPLACE VIEW {database}.report_facts AS\n"  # nosec B608
             f"SELECT date, userid, client_type, chat_conversations, credits_used,\n"
@@ -173,23 +203,32 @@ def report_tables_ddl(database: str, bucket: str, prefix: str) -> list[str]:
             f"FROM (\n"
             f"  SELECT *, ROW_NUMBER() OVER (\n"
             f"      PARTITION BY date, userid, upper(client_type)\n"
-            f"      ORDER BY export_ts DESC, src_path DESC\n"
+            f"      ORDER BY export_ts DESC, COALESCE(processed_ts, '') DESC,\n"
+            f"               COALESCE(part_id, '') DESC\n"
             f"  ) AS rn\n"
             f"  FROM {database}.report_facts_raw\n"
             f")\n"
             f"WHERE rn = 1"
         ),
         # Dedup view for models: the authoritative snapshot for a (date,user,
-        # client) is the latest export's FILE, so we rank by the same key (NOT
-        # including model_name) and keep all model rows from the winning file.
-        # Ranking by the file's (export_ts, src_path) and keeping rn over the
-        # per-file row set would need the file id; instead we pick the winning
-        # (export_ts, src_path) per key from the facts ranking and join.
+        # client) is the latest export's PART, so we pick the winning part per
+        # key (NOT including model_name) and keep all of its model rows.
+        #
+        # We join on part_id, NOT src_path. src_path identifies the SOURCE FILE,
+        # and a file re-exported in place produces two parts sharing it - so the
+        # old join matched BOTH parts and every per-model count was added twice.
+        # Observed live: 12,001 of 21,719 keys matched two parts, inflating total
+        # messages from 1.40M to 2.69M. part_id is unique per part, so exactly
+        # one part can win. The winner is chosen with the same
+        # (export_ts, processed_ts, part_id) ordering report_facts uses, so the
+        # two views never disagree about which part is authoritative.
         (
             f"CREATE OR REPLACE VIEW {database}.report_models AS\n"  # nosec B608
             f"WITH winning AS (\n"
             f"  SELECT date, userid, upper(client_type) AS client_u,\n"
-            f"         max_by(src_path, (export_ts, src_path)) AS win_src\n"
+            f"         max_by(COALESCE(part_id, ''),\n"
+            f"                (export_ts, COALESCE(processed_ts, ''),\n"
+            f"                 COALESCE(part_id, ''))) AS win_part\n"
             f"  FROM {database}.report_facts_raw\n"
             f"  GROUP BY date, userid, upper(client_type)\n"
             f")\n"
@@ -199,7 +238,7 @@ def report_tables_ddl(database: str, bucket: str, prefix: str) -> list[str]:
             f"JOIN winning w\n"
             f"  ON m.date = w.date AND m.userid = w.userid\n"
             f" AND upper(m.client_type) = w.client_u\n"
-            f" AND m.src_path = w.win_src"
+            f" AND COALESCE(m.part_id, '') = w.win_part"
         ),
     ]
 

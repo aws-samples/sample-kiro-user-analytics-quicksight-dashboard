@@ -29,21 +29,25 @@ Scaling design (streaming + incremental):
   by export_date and is INCREMENTAL: a file whose part already exists (same key
   + ETag) is skipped, so a steady-state daily run processes only the new file.
   Dedup (latest export wins per date/user/client) is NOT done here - every
-  part carries src_path + export_ts bookkeeping columns and an Athena view
-  ranks them with ROW_NUMBER(). See build_views.report_tables_ddl / the dedup
-  views. This keeps the set-based dedup in SQL (where it scales) and the
-  header-binding in compute (the one thing SQL cannot do).
+  part carries src_path + export_ts + part_id + processed_ts bookkeeping
+  columns and an Athena view ranks them with ROW_NUMBER(). See
+  build_views.report_tables_ddl / the dedup views. This keeps the set-based
+  dedup in SQL (where it scales) and the header-binding in compute (the one
+  thing SQL cannot do).
 
 What it writes (both fixed-schema FOREVER, regardless of how many models Kiro
 adds):
   normalized/facts/export_date=YYYY-MM-DD/part-<hash>.csv
       one row per (activity_date, user_id, client_type) per source file, with
-      the stable scalar columns + src_path + export_ts. Header-keyed, so source
-      column order never matters.
+      the stable scalar columns + the bookkeeping columns. Header-keyed, so
+      source column order never matters.
   normalized/models/export_date=YYYY-MM-DD/part-<hash>.csv
       LONG form: one row per (activity_date, user_id, client_type, model_name,
-      messages) + src_path + export_ts. model_name is a VALUE, not a column -
+      messages) + the bookkeeping columns. model_name is a VALUE, not a column -
       so a new Kiro model adds ROWS, never a column, and the schema is stable.
+  <hash> is sha256(source key | ETag), so re-running over unchanged files
+  rewrites the same parts (idempotent) while changed content lands in a new
+  part - see _BOOKKEEPING for how the dedup then supersedes the old one.
 
 Each part is CSV with a header line; the Athena external tables over them use
 OpenCSVSerDe with skip.header.line.count=1 and partition projection on
@@ -51,9 +55,13 @@ export_date. Positional parsing is safe DOWNSTREAM because WE author these
 parts with a fixed, known column order.
 
 Fail-closed: a per-file failure aborts that file (its prior good part stays in
-place); we never delete existing output. Partially-processed runs are safe
-because each file's part is written atomically and the Athena dedup view only
-ever surfaces the latest export per key.
+place); we NEVER delete existing output - this Lambda issues no S3 delete of any
+kind, by design, because it runs against a customer's own bucket. Partially
+processed runs are safe because each file's part is written atomically and the
+Athena dedup view only ever surfaces the latest export per key. A superseded
+part therefore lingers as unreachable storage rather than being removed;
+reclaiming it (S3 lifecycle, or manual clean-up + REPROCESS_ALL) is a customer
+decision, and the normalized output is fully regenerable from the raw exports.
 
 Environment variables (set by cfn/01-data-layer.yaml):
   RAW_BUCKET     bucket holding the raw Kiro export CSVs
@@ -72,6 +80,7 @@ import hashlib
 import io
 import os
 import re
+from datetime import datetime, timezone
 
 import boto3
 from botocore.config import Config
@@ -100,8 +109,30 @@ _FACT_COLUMNS = [
 ]
 
 # Bookkeeping columns appended to EVERY normalized row so the Athena dedup view
-# can pick the latest export per key (latest export_ts, then src_path).
-_BOOKKEEPING = ["src_path", "export_ts"]
+# can pick the latest export per key.
+#
+# part_id identifies the PART this row was written into, and is what makes the
+# dedup deterministic. A part is named sha256(source key | ETag), so when a
+# source CSV is re-exported IN PLACE with different content it gets a NEW part
+# name and the previous part is orphaned rather than overwritten - both then sit
+# in the same export_date partition describing the same (date,user,client) keys.
+# src_path and export_ts are IDENTICAL across those two parts (same source
+# file), so ranking on them alone was a tie, with two consequences:
+#   * report_facts picked a winner arbitrarily, so a query could return the
+#     STALE row (non-deterministic between identical queries).
+#   * report_models joined on src_path, which matches BOTH parts, so per-model
+#     messages were DOUBLE-COUNTED.
+# part_id breaks the tie deterministically, and because it is unique per part it
+# also lets the models view join to exactly one part. We do not delete the
+# superseded part - nothing in this pipeline deletes from a customer bucket -
+# it simply becomes unreachable.
+#
+# processed_ts (UTC, YYYYMMDDHHMMSS - lexically sortable) is WHEN this part was
+# written, which is the only ordering that actually means "newer content": the
+# part_id hash is unordered, and export_ts comes from the source filename so it
+# is equal for both parts. Ranking on processed_ts DESC therefore prefers the
+# most recently normalized version of a re-exported file.
+_BOOKKEEPING = ["src_path", "export_ts", "part_id", "processed_ts"]
 
 # Fixed output headers (data columns + bookkeeping). Order is authoritative -
 # the external-table DDL in build_views.py must match exactly.
@@ -202,12 +233,16 @@ def _exists(s3, bucket: str, key: str) -> bool:
         return False
 
 
-def _parse_file(body: str, source_key: str) -> tuple[list, list]:
+def _parse_file(body: str, source_key: str, part_id: str,
+                processed_ts: str) -> tuple[list, list]:
     """Parse one raw CSV (header-keyed) into (fact_rows, model_rows) for this
     file only. Column ORDER and the presence/absence of any model column or
     New_User are irrelevant - every value is looked up by header name, which is
     what makes this immune to the positional bug. No cross-file dedup here -
-    that happens in the Athena view via the src_path/export_ts columns."""
+    that happens in the Athena views via the bookkeeping columns.
+
+    part_id / processed_ts identify and time-stamp the part these rows land in;
+    see _BOOKKEEPING for why the dedup needs both."""
     reader = csv.DictReader(io.StringIO(body))
     if reader.fieldnames is None:
         return [], []
@@ -216,6 +251,7 @@ def _parse_file(body: str, source_key: str) -> tuple[list, list]:
 
     src = source_key
     ts = _export_ts(source_key)
+    book = [src, ts, part_id, processed_ts]
     fact_rows: list = []
     model_rows: list = []
 
@@ -229,13 +265,13 @@ def _parse_file(body: str, source_key: str) -> tuple[list, list]:
         client_v = get("client_type")
         tier_v = get("subscription_tier")
 
-        fact_rows.append([get(c) for c in _FACT_COLUMNS] + [src, ts])
+        fact_rows.append([get(c) for c in _FACT_COLUMNS] + book)
 
         for mk in model_keys:
             msgs = _to_int(row.get(key_to_header[mk], ""))
             if msgs > 0:
                 model_rows.append(
-                    [date_v, user_v, client_v, tier_v, _model_name(mk), msgs, src, ts]
+                    [date_v, user_v, client_v, tier_v, _model_name(mk), msgs] + book
                 )
     return fact_rows, model_rows
 
@@ -263,6 +299,12 @@ def handler(event, context):  # noqa: ARG001 - Lambda signature
     s3 = _s3()
     objects = _list_csv_objects(s3, raw_bucket, raw_prefix)
 
+    # Stamped once per invocation: every part written by this run shares it, and
+    # a later run always has a strictly greater value. That is what lets the
+    # dedup views prefer the most recently normalized part when a source file
+    # was re-exported in place (see _BOOKKEEPING).
+    processed_ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+
     processed = 0
     skipped = 0
     fact_total = 0
@@ -279,8 +321,9 @@ def handler(event, context):  # noqa: ARG001 - Lambda signature
         # Incremental skip: a part keyed by (src_key, ETag) already existing
         # means this exact file content was normalized before. A re-exported
         # file with changed content has a different ETag -> new part -> it is
-        # reprocessed (self-healing). The Athena dedup view then prefers the
-        # latest export_ts, so stale parts from an earlier ETag never surface.
+        # reprocessed (self-healing). The superseded part is left in place (we
+        # never delete from a customer bucket); the dedup views rank on
+        # processed_ts so only the newest part is reachable.
         if not reprocess_all and _exists(s3, out_bucket, facts_key):
             skipped += 1
             continue
@@ -288,7 +331,7 @@ def handler(event, context):  # noqa: ARG001 - Lambda signature
         body = s3.get_object(Bucket=raw_bucket, Key=src_key)["Body"].read().decode(
             "utf-8-sig"  # tolerate a UTF-8 BOM on the header cell
         )
-        fact_rows, model_rows = _parse_file(body, src_key)
+        fact_rows, model_rows = _parse_file(body, src_key, part, processed_ts)
 
         # Write models first then facts: the facts part is the skip sentinel
         # (checked above), so writing it LAST means a mid-file crash never

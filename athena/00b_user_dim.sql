@@ -46,12 +46,6 @@ SELECT
     -- email (often empty), whereas idc_email comes from the directory.
     ${dim_idc_username}                        AS idc_username,
     ${dim_idc_email}                           AS idc_email,
-    CASE upper(COALESCE(subscription_tier_raw, ''))
-        WHEN 'PRO'      THEN 'Pro'
-        WHEN 'PRO_PLUS' THEN 'Pro+'
-        WHEN 'POWER'    THEN 'Power'
-        WHEN ''         THEN 'Unknown'
-        ELSE subscription_tier_raw
-    END                                        AS subscription_tier
+    ${tier_label_dim}                          AS subscription_tier
 FROM email_per_user
 ${dim_identity_join};

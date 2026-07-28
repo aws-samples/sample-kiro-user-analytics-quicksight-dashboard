@@ -67,7 +67,8 @@ _AUTO_NUMBER_FORMAT = {
 # slots per-visual by alphabetical category order, and e.g. "Power" can be one
 # color on Activity and another on Economics). Colors are drawn from the theme
 # DataColorPalette (cfn/02-quicksight.yaml). Values must match what the views
-# emit: tier is normalized to Pro/Pro+/Power/Unknown (00_base_user_activity),
+# emit: tier is normalized to friendly labels by tier_label_expr in
+# build_views.py (Free/Pro/Pro+/Pro Max/Power/Unknown),
 # client_type is upper()'d (KIRO_IDE/KIRO_CLI/PLUGIN). A value not in the map
 # falls back to normal palette assignment, so new client types still render.
 # Kiro brand purple - the "primary/now/headline" convention. Used for Power
@@ -85,9 +86,18 @@ _BRAND_ORANGE = "#FF8C00"
 # hexes. Pro uses a LIGHT blue (#4DA6FF) rather than #0972D3 so it stays
 # distinguishable from Power-purple under protanopia (purple/blue converge for
 # red-blind viewers; the lightness gap rescues it).
+# Keep the keys in sync with _TIER_LABELS in build_views.py (the raw ->
+# display-label mapping the views apply). A label with no entry here still
+# renders, just from the auto palette.
+# Kiro's four tiers, cheapest to richest. There is no Free entry: Free exists
+# only on Builder IDs, and this dashboard reports on an enterprise Kiro
+# subscription, where Pro is the entry plan - so a Free row cannot appear in
+# the export. (If one ever did, the fallback in tier_label_expr would still
+# render it as 'Free'; it would just pick a colour from the auto palette.)
 _TIER_COLORS = {
     "Pro":     "#4DA6FF",   # light cyan-blue (separates from Power-purple under CVD)
     "Pro+":    "#E7157B",   # magenta
+    "Pro Max": "#C77F00",   # burnt orange (distinct from Warning/CLI #FF8C00)
     "Power":   "#9046FF",   # Kiro purple - the ONE reserved meaning of brand purple
     "Unknown": "#8C8C8C",   # grey - de-emphasized
 }
@@ -1320,9 +1330,9 @@ def build_definition(account_id: str, region: str, resource_prefix: str,
                 _sub(_bar_time_stacked("a-credits",     "Daily credits used (by client)", "tiers", "activity_date", "credits_used", stack_col="client_type"),
                      "Daily credit consumption stacked by client - the cost story. Which surface drives most spend?"),
                 # Daily active users stacked by tier - replaces the earlier
-                # tier × day heatmap which read poorly with only 3 tiers.
+                # tier × day heat map, which read poorly across so few tiers.
                 _sub(_bar_time_stacked("a-tier-trend", "Daily active users by tier", "heatmap", "activity_date", "active_users", stack_col="subscription_tier"),
-                     "Daily distinct users by tier (each counted once per day). POWER share rising = good adoption."),
+                     "Daily distinct users by tier (each counted once per day). Power share rising = good adoption."),
                 # New vs returning active users per day - the adoption/onboarding
                 # signal. new_users / returning_users are separate columns on
                 # daily_trends. STACKED bars: the two are mutually exclusive
@@ -1382,9 +1392,10 @@ def build_definition(account_id: str, region: str, resource_prefix: str,
                 # Group by user_label + user_tier (NOT subscription_tier):
                 # subscription_tier is per-row in base, so a user who changed
                 # tier mid-window (e.g. Pro -> Pro+) would split into two rows.
-                # user_tier is a per-user CONSTANT (MAX over the window in the
-                # base view, so 'PRO_PLUS' > 'PRO' -> highest/most-recent tier
-                # wins) - grouping on it adds no extra rows, so each user is one
+                # user_tier is a per-user CONSTANT (the tier from the user's most
+                # recent activity day - max_by over date in the base view, i.e.
+                # their CURRENT plan) - grouping on it adds no extra rows, so
+                # each user is one
                 # row with usage metrics summed across whatever tier(s) they
                 # held in the selected range. A categorical MAX in the visual
                 # layer isn't possible (CategoricalMeasureField only allows
@@ -1489,7 +1500,7 @@ def build_definition(account_id: str, region: str, resource_prefix: str,
             "ContentType": "INTERACTIVE",
             "Visuals": [
                 _sub(_pie_count("e-users-by-tier", "Users by tier", "base", "subscription_tier", "user_id"),
-                     "Distinct users active in each tier (Pro / Pro+ / Power) within the selected window."),
+                     "Distinct users active in each tier (Pro / Pro+ / Pro Max / Power) within the selected window."),
                 # Stacked: in-plan (calc, no agg) + overage (summed) per tier.
                 _sub({
                     "BarChartVisual": {

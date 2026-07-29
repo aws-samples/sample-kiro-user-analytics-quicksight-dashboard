@@ -68,7 +68,7 @@ Most visuals respond to the date-range picker, but one uses a **fixed window** b
 
 * An [AWS account](https://aws.amazon.com/account/) with permissions to deploy AWS CloudFormation stacks and create the resources used by this solution: AWS Glue (database), Amazon Athena (workgroup), AWS Lambda (the report normalizer + IAM role) and Amazon EventBridge (its daily schedule), Amazon S3 (one results bucket), and Amazon QuickSight (data source, datasets, refresh schedules, analysis, dashboard). Administrator access is sufficient but not required - the equivalent service permissions work.
 * The Kiro **User Activity Report** export to Amazon S3 enabled by a Kiro administrator. See the [Kiro user activity report documentation](https://kiro.dev/docs/enterprise/monitor-and-track/user-activity/).
-* **Amazon QuickSight Enterprise edition** active in the same AWS Region as the Amazon S3 bucket. The Athena data source cannot cross AWS Regions.
+* **Amazon QuickSight Enterprise edition** active in the AWS Region you deploy into (`AWS_REGION`). The Kiro logs bucket may be in a **different** Region - see [Deploying across Regions](#deploying-across-regions).
 * Amazon Athena enabled in QuickSight (QuickSight -> Manage account -> Permissions -> AWS resources -> check **Athena**). The deploy script does not toggle this for you - Amazon QuickSight requires the toggle to be set via the console. The same screen also asks you to select Amazon S3 buckets; leave the S3 selection empty (the deploy script handles S3 access separately, see the next bullet). When you click Save, QuickSight should attach the `AWSQuicksightAthenaAccess` managed policy to the QuickSight service role - in some accounts this attachment silently fails. The deploy script verifies the policy is attached and offers to attach it for you if it is not.
 * Amazon S3 access for Amazon QuickSight does **not** need to be pre-configured via the console. The deploy script grants S3 access automatically by attaching an inline IAM policy (`KiroAnalyticsQuickSightS3Access`) to the QuickSight service role. Read on the Kiro logs bucket, read + write on the Athena results bucket (Athena queries run by QuickSight write their results there). The console-managed `AWSQuickSightS3Policy` is left untouched, so the QuickSight console keeps full ownership of it - this avoids the *"This policy was modified outside of QuickSight"* warning that appears when the console-managed policy is edited by another tool. See [QuickSight permission errors](https://repost.aws/knowledge-center/quicksight-permission-errors) and [Athena output bucket error](https://repost.aws/knowledge-center/athena-output-bucket-error) for background.
 * AWS CLI v2, Python 3.10 or later, and the `boto3` Python package (install with `python3 -m pip install 'boto3>=1.34'` if not already present).
@@ -107,7 +107,7 @@ Most visuals respond to the date-range picker, but one uses a **fixed window** b
 
      For users signed in via AWS IAM Identity Center or SSO the `UserName` may contain a slash (e.g. `Admin/sso-session`); copy the ARN from this command verbatim rather than constructing it by hand.
 
-   * **`AWS_REGION`** - the Amazon QuickSight home region; it must match the AWS Region of the Kiro logs bucket. The Amazon Athena data source created by the QuickSight stack cannot cross regions.
+   * **`AWS_REGION`** - the Region to deploy into. Amazon QuickSight must be active here, because everything the stack creates (Glue database, Athena workgroup, results bucket, Lambda, datasets, dashboard) is created in this Region. It does **not** have to match the Region of `KIRO_LOGS_BUCKET` - see [Deploying across Regions](#deploying-across-regions).
 
    * **`KIRO_LOGS_PREFIX`** - the path inside `KIRO_LOGS_BUCKET` above `AWSLogs/<account-id>/KiroLogs/user_report/`. **Setting it explicitly is strongly recommended.** If unset, the deploy and preflight scripts run `aws s3 ls --recursive` to auto-detect it, which paginates through every key in the bucket. On large buckets that hold other content (Amazon Q logs, other AWS service logs, prompt logs from another product) this can take many minutes and incurs a per-1000-keys Amazon S3 LIST charge. To find the right value, list the bucket non-recursively:
 
@@ -153,6 +153,27 @@ Most visuals respond to the date-range picker, but one uses a **fixed window** b
    * **Skip the prompt with `AUTO_APPROVE_IAM=true`**: applies the policy without asking. Use in CI where you've already reviewed the change.
 
    The dashboard URL is printed at the end of the run.
+
+### Deploying across Regions
+
+**The Kiro logs bucket does not have to be in the same Region as the dashboard.** Set `AWS_REGION` to wherever you want the dashboard (and where QuickSight is active) and point `KIRO_LOGS_BUCKET` at the export bucket in whatever Region it happens to be:
+
+```bash
+export AWS_REGION=sa-east-1                      # dashboard + QuickSight here
+export KIRO_LOGS_BUCKET=my-kiro-exports          # this bucket can be in us-east-1
+```
+
+No extra configuration, flags, or code changes are needed.
+
+This works because of where each component reads from. Only the **normalizer Lambda** touches the raw Kiro bucket, and a cross-Region S3 `GetObject` is entirely normal. It writes the normalized parts to the results bucket that **this stack creates in `AWS_REGION`**, and that is the only location the Athena external tables point at - so Athena, Glue, and QuickSight all operate wholly within `AWS_REGION` on local data.
+
+Verified end to end with the source bucket in `eu-west-1` and the entire stack in `us-east-1`: all source files normalized, all views built, all SPICE datasets ingested, dashboard published.
+
+What *is* Region-bound:
+
+* **QuickSight must be active in `AWS_REGION`.** The Athena data source has no Region parameter (`AthenaParameters` carries only `WorkGroup`/`RoleArn`), so QuickSight and the Athena workgroup must be co-located. The stack always creates the workgroup in `AWS_REGION`, so this is satisfied automatically. Note a QuickSight account is per-AWS-account and lives in one Region unless you explicitly enable others - if `preflight.sh` reports QuickSight is not reachable, that is what it means.
+* **AWS KMS keys are Regional.** If the Kiro bucket is encrypted with a customer-managed key, that key cannot be used from another Region, so the normalizer Lambda will fail to decrypt. In that case deploy in the bucket's Region, or replicate the data. A bucket using default SSE-S3 encryption is unaffected.
+* **Inter-Region data transfer** applies to the Lambda's reads of the raw bucket. The daily export is a handful of small CSV files, so this is negligible - but it is not zero.
 
 ### Testing the deployment
 

@@ -52,6 +52,14 @@ IDENTITY_MAP_REFRESH_SCHEDULE="${IDENTITY_MAP_REFRESH_SCHEDULE:-cron(30 3 * * ? 
 # AWS Glue DB and Athena workgroup names are namespaced to STACK_PREFIX so multiple
 # parallel deployments in the same account/region don't collide. AWS Glue DB names
 # must be lower-case and use underscores, so swap hyphens.
+# The QuickSight inline S3 policy is namespaced to STACK_PREFIX. All
+# deployments in an account share ONE QuickSight service role, and
+# grant_quicksight_s3.py writes this policy with put_role_policy (a wholesale
+# replace), so a shared name means deploying one stack silently strips another
+# stack's bucket grants - the victim then fails its next SPICE refresh. IAM
+# policy names allow [\w+=,.@-], so hyphens are fine as-is.
+QS_S3_POLICY_NAME="${QS_S3_POLICY_NAME:-${STACK_PREFIX}-QuickSightS3Access}"
+
 DATABASE_NAME="${DATABASE_NAME:-${STACK_PREFIX//-/_}}"
 WORKGROUP_NAME="${WORKGROUP_NAME:-${STACK_PREFIX//-/_}}"
 
@@ -450,6 +458,7 @@ set +e
 python3 "${ROOT}/scripts/grant_quicksight_s3.py" \
     --region "${REGION}" \
     --role-name "${QS_IAM_ROLE_NAME}" \
+    --policy-name "${QS_S3_POLICY_NAME}" \
     --buckets "${QS_S3_BUCKET_SPECS[@]}" \
     "${QS_KMS_ARGS[@]+"${QS_KMS_ARGS[@]}"}"
 QS_S3_RC=$?
@@ -466,6 +475,7 @@ case "${QS_S3_RC}" in
             python3 "${ROOT}/scripts/grant_quicksight_s3.py" --apply \
                 --region "${REGION}" \
                 --role-name "${QS_IAM_ROLE_NAME}" \
+                --policy-name "${QS_S3_POLICY_NAME}" \
                 --buckets "${QS_S3_BUCKET_SPECS[@]}" \
                 "${QS_KMS_ARGS[@]+"${QS_KMS_ARGS[@]}"}"
         elif [[ -t 0 ]]; then
@@ -474,6 +484,7 @@ case "${QS_S3_RC}" in
                 python3 "${ROOT}/scripts/grant_quicksight_s3.py" --apply \
                     --region "${REGION}" \
                     --role-name "${QS_IAM_ROLE_NAME}" \
+                    --policy-name "${QS_S3_POLICY_NAME}" \
                     --buckets "${QS_S3_BUCKET_SPECS[@]}" \
                     "${QS_KMS_ARGS[@]+"${QS_KMS_ARGS[@]}"}"
             else
@@ -665,11 +676,13 @@ PY
     python3 "${ROOT}/scripts/grant_quicksight_s3.py" --revoke \
         --region "${REGION}" \
         --role-name "${QS_IAM_ROLE_NAME}" \
+        --policy-name "${QS_S3_POLICY_NAME}" \
         --buckets "${KIRO_LOGS_BUCKET}:read" \
         || echo "   (could not revoke QS grant; remove the identity-map statements manually)" >&2
     python3 "${ROOT}/scripts/grant_quicksight_s3.py" --apply \
         --region "${REGION}" \
         --role-name "${QS_IAM_ROLE_NAME}" \
+        --policy-name "${QS_S3_POLICY_NAME}" \
         --buckets "${KIRO_LOGS_BUCKET}:read" "${RESULTS_BUCKET}:read_write" \
         || echo "   (could not re-apply base QS grant; re-run deploy.sh)" >&2
 

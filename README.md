@@ -120,8 +120,8 @@ Most visuals respond to the date-range picker, but one uses a **fixed window** b
    Optional environment variables:
 
    * **HASH_EMAILS** (default `false`): SHA-256 emails at the view layer so plaintext does not reach SPICE.
-   * **KMS_KEY_ARN** (default empty): AWS Key Management Service (AWS KMS) key ARN that encrypts the Kiro logs bucket. The report-normalizer Lambda role is granted `kms:Decrypt` on this key.
-   * **STACK_PREFIX** (default `kiro-analytics`): Prefix for the two AWS CloudFormation stacks.
+   * **KMS_KEY_ARN** (default empty): AWS Key Management Service (AWS KMS) key ARN that encrypts the Kiro logs bucket. The report-normalizer Lambda role is granted `kms:Decrypt` on this key. Required if the bucket uses a customer-managed key - including when that key is in a different Region from `AWS_REGION` (see [Deploying across Regions](#deploying-across-regions)). Not needed for default SSE-S3 encryption.
+   * **STACK_PREFIX** (default `kiro-analytics`): Prefix for the two AWS CloudFormation stacks. It also namespaces the Glue database, the Athena workgroup, the QuickSight asset IDs, and the QuickSight inline S3 policy, so several deployments can coexist in one account - give each a distinct prefix.
    * **QS_IAM_ROLE_NAME** (default `aws-quicksight-service-role-v0`): The IAM role QuickSight uses to access AWS resources. Change this if your QS account is configured under QuickSight -> Manage account -> Permissions -> IAM role -> "Use an existing role" - set it to the name of that existing role. The deploy script confirms the role with you before writing to it.
    * **THEME_MODE** (default `light`): Set to `dark` for a dark-mode dashboard. The Kiro purple categorical palette is the same in both modes; only the background and text colors flip.
    * **IDENTITY_MAPPING** (default `false`): Resolve the report's opaque `user_id` GUIDs to human names via AWS IAM Identity Center. Opt-in; see [Resolving user identities](#resolving-user-identities-optional) below. On an interactive deploy you are prompted `y/N` if this is unset. Mutually exclusive with `HASH_EMAILS`.
@@ -172,7 +172,7 @@ Verified end to end with the source bucket in `eu-west-1` and the entire stack i
 What *is* Region-bound:
 
 * **QuickSight must be active in `AWS_REGION`.** The Athena data source has no Region parameter (`AthenaParameters` carries only `WorkGroup`/`RoleArn`), so QuickSight and the Athena workgroup must be co-located. The stack always creates the workgroup in `AWS_REGION`, so this is satisfied automatically. Note a QuickSight account is per-AWS-account and lives in one Region unless you explicitly enable others - if `preflight.sh` reports QuickSight is not reachable, that is what it means.
-* **AWS KMS keys are Regional.** If the Kiro bucket is encrypted with a customer-managed key, that key cannot be used from another Region, so the normalizer Lambda will fail to decrypt. In that case deploy in the bucket's Region, or replicate the data. A bucket using default SSE-S3 encryption is unaffected.
+* **A CMK-encrypted bucket needs `KMS_KEY_ARN`** - including across Regions. If the Kiro bucket is encrypted with a customer-managed key, set `KMS_KEY_ARN` to that key's ARN so the stack grants the normalizer Lambda `kms:Decrypt` on it. This works cross-Region: a key is Regional in the sense that it lives in one Region and cannot be copied out of it, but it can be *called* from another Region, so a Lambda in `AWS_REGION` decrypts objects encrypted with a key in the bucket's Region. Verified with an `eu-west-1` CMK-encrypted bucket and the stack in `us-east-1`. Omitting `KMS_KEY_ARN` fails with `AccessDenied ... not authorized to perform: kms:Decrypt`; a bucket using default SSE-S3 encryption needs nothing.
 * **Inter-Region data transfer** applies to the Lambda's reads of the raw bucket. The daily export is a handful of small CSV files, so this is negligible - but it is not zero.
 
 ### Testing the deployment

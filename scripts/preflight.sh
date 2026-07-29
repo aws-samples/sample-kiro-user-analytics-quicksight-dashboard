@@ -62,16 +62,24 @@ if [[ -n "${ACCOUNT_ID}" ]]; then
     fi
 fi
 
-# 3.5) QS region matches data region - Athena DataSource doesn't take a
-# region override, so QS must be in the same region as the workgroup.
+# 3.5) QS must be reachable in the DEPLOY region. The Athena DataSource has no
+# region override (AthenaParameters carries only WorkGroup/RoleArn), so
+# QuickSight and the Athena workgroup must be co-located - and the stack always
+# creates the workgroup in AWS_REGION, so this check is simply "is QS here?".
+#
+# This is NOT a constraint on where the Kiro logs bucket lives. Athena only ever
+# reads the NORMALIZED parts, which the normalizer Lambda writes to the results
+# bucket this stack creates in AWS_REGION; the raw bucket is read solely by that
+# Lambda, and a cross-region S3 GetObject is fine. Verified end to end with the
+# source bucket in eu-west-1 and the whole stack in us-east-1.
 echo
-echo "[3.5/6] QuickSight region matches data region"
+echo "[3.5/6] QuickSight is available in the deploy region"
 QS_HOME_REGION="$(aws quicksight describe-account-settings --aws-account-id "${ACCOUNT_ID}" \
     --region "${REGION}" --query 'AccountSettings.DefaultNamespace' --output text 2>/dev/null || true)"
 if [[ -n "${QS_HOME_REGION}" ]]; then
     ok "QuickSight reachable in ${REGION}"
 else
-    fail "QuickSight not reachable in ${REGION}. The Athena DataSource cannot cross regions; sign QS up in ${REGION} or move data to QS's region."
+    fail "QuickSight not reachable in ${REGION}. Sign QuickSight up in ${REGION}, or set AWS_REGION to a region where it already is. (This is about QuickSight only - KIRO_LOGS_BUCKET may be in any region.)"
 fi
 
 # 4) QS user exists

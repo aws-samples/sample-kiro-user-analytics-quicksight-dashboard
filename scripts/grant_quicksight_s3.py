@@ -2,12 +2,19 @@
 """
 Grant Amazon QuickSight access to the buckets this dashboard reads and writes.
 
-We attach an *inline* IAM policy named `KiroAnalyticsQuickSightS3Access` to
-the QuickSight service role `aws-quicksight-service-role-v0`. This is
-strictly additive - IAM unions all attached policies on a role, so the
-buckets QS already has access to via the console-managed AWSQuickSightS3Policy
-keep working. We do not modify AWSQuickSightS3Policy itself; the QuickSight
-console retains full ownership of it.
+We attach an *inline* IAM policy (see --policy-name) to the QuickSight service
+role `aws-quicksight-service-role-v0`. This is strictly additive with respect
+to OTHER policies - IAM unions all policies on a role, so the buckets QS
+already has access to via the console-managed AWSQuickSightS3Policy keep
+working. We do not modify AWSQuickSightS3Policy itself; the QuickSight console
+retains full ownership of it.
+
+It is NOT additive with respect to itself: --apply writes the named policy with
+put_role_policy (a wholesale replace) and --revoke deletes it. Since every
+deployment in an account shares the one QuickSight service role, the policy
+name must be unique per deployment or one stack will strip another's grants.
+deploy.sh and teardown.sh therefore pass --policy-name derived from
+STACK_PREFIX.
 
 Two access modes per bucket:
     read         - needed for the Kiro logs bucket (source data).
@@ -37,7 +44,19 @@ import boto3
 from botocore.exceptions import ClientError
 
 DEFAULT_ROLE_NAME = "aws-quicksight-service-role-v0"  # the QS-managed default
-INLINE_POLICY_NAME = "KiroAnalyticsQuickSightS3Access"
+
+# Default inline-policy name. Callers SHOULD pass --policy-name derived from
+# their STACK_PREFIX so two deployments in one account never share a policy.
+#
+# Why that matters: this script writes the policy with put_role_policy, which
+# REPLACES the named policy wholesale, and --revoke deletes it outright. All
+# deployments in an account share one QuickSight service role, so a single
+# fixed name means deploying stack B silently strips stack A's bucket grants -
+# stack A then fails its next SPICE refresh with "Unable to verify/create
+# output bucket" or a PERMISSION_DENIED on s3:ListBucket. Observed in practice
+# with two deployments in one account. Namespacing by stack prefix keeps each
+# deployment's grants independent.
+DEFAULT_INLINE_POLICY_NAME = "KiroAnalyticsQuickSightS3Access"
 
 READ_BUCKET_ACTIONS  = ["s3:ListBucket", "s3:GetBucketLocation"]
 READ_OBJECT_ACTIONS  = ["s3:GetObject", "s3:GetObjectVersion"]
@@ -167,10 +186,11 @@ def policy_covers(current: dict, desired: dict) -> bool:
 
 def print_plan(current: dict | None, desired: dict, region: str, role_name: str,
                bucket_specs: list[tuple[str, str]],
-               kms_key_arns: list[str] | None = None) -> None:
+               kms_key_arns: list[str] | None = None,
+               policy_name: str = DEFAULT_INLINE_POLICY_NAME) -> None:
     action = "CREATE" if current is None else "UPDATE"
     print(
-        f"\n[{action}] Would write inline policy {INLINE_POLICY_NAME!r} on "
+        f"\n[{action}] Would write inline policy {policy_name!r} on "
         f"{role_name}:",
         file=sys.stderr,
     )
@@ -181,10 +201,15 @@ def print_plan(current: dict | None, desired: dict, region: str, role_name: str,
     spec_str = " ".join(f"{b}:{m}" for b, m in bucket_specs)
     kms_arg = "".join(f" --kms-key-arn {k}" for k in (kms_key_arns or []))
     role_arg = "" if role_name == DEFAULT_ROLE_NAME else f" --role-name {role_name}"
+    # Echo --policy-name whenever it is non-default, so the copy-pasteable
+    # command writes the SAME policy this plan describes (pasting it without
+    # the flag would write the default-named policy instead).
+    policy_arg = ("" if policy_name == DEFAULT_INLINE_POLICY_NAME
+                  else f" --policy-name {policy_name}")
     print(
         "\nApply now:\n"
         f"  python3 scripts/grant_quicksight_s3.py --apply \\\n"
-        f"      --region {region}{role_arg} --buckets {spec_str}{kms_arg}",
+        f"      --region {region}{role_arg}{policy_arg} --buckets {spec_str}{kms_arg}",
         file=sys.stderr,
     )
     print(
@@ -215,13 +240,23 @@ def main() -> int:
         help="KMS key ARN that QuickSight/Athena must be able to Decrypt "
              "(the SSE-KMS identity-map bucket's CMK). Repeatable.",
     )
+    p.add_argument(
+        "--policy-name", default=DEFAULT_INLINE_POLICY_NAME,
+        help="Name of the inline policy to write on the role. Default: "
+             f"{DEFAULT_INLINE_POLICY_NAME!r}. deploy.sh/teardown.sh pass a "
+             "name derived from STACK_PREFIX so parallel deployments in one "
+             "account do not overwrite each other's grants (this policy is "
+             "written with put_role_policy, which replaces it wholesale).",
+    )
     p.add_argument("--apply", action="store_true",
-                   help=f"Write the inline role policy {INLINE_POLICY_NAME!r}. "
+                   help="Write the inline role policy (see --policy-name). "
                         "Without this, the script prints the plan and exits 1.")
     p.add_argument("--revoke", action="store_true",
-                   help=f"Delete the inline role policy {INLINE_POLICY_NAME!r}. "
-                        "Used by teardown.")
+                   help="Delete the inline role policy (see --policy-name). "
+                        "Used by teardown. NOTE: this removes the ENTIRE named "
+                        "policy; --buckets is ignored for revoke.")
     args = p.parse_args()
+    policy_name = args.policy_name
 
     bucket_specs = parse_bucket_specs(args.buckets)
     role_name = args.role_name
@@ -246,37 +281,37 @@ def main() -> int:
         return 2
 
     print(f">> QuickSight IAM role: {role_name}", file=sys.stderr)
-    current = get_inline_policy(iam, role_name, INLINE_POLICY_NAME)
+    current = get_inline_policy(iam, role_name, policy_name)
 
     if args.revoke:
         if current is None:
-            print(f"[OK] Inline policy {INLINE_POLICY_NAME!r} not present on "
+            print(f"[OK] Inline policy {policy_name!r} not present on "
                   f"{role_name}; nothing to revoke.", file=sys.stderr)
             return 0
-        iam.delete_role_policy(RoleName=role_name, PolicyName=INLINE_POLICY_NAME)
-        print(f"[OK] Removed inline policy {INLINE_POLICY_NAME!r} from {role_name}.",
+        iam.delete_role_policy(RoleName=role_name, PolicyName=policy_name)
+        print(f"[OK] Removed inline policy {policy_name!r} from {role_name}.",
               file=sys.stderr)
         return 0
 
     desired = render_policy(bucket_specs, args.kms_key_arn)
 
     if current is not None and policy_covers(current, desired):
-        print(f"[OK] Inline policy {INLINE_POLICY_NAME!r} already covers all "
+        print(f"[OK] Inline policy {policy_name!r} already covers all "
               f"requested buckets and actions.", file=sys.stderr)
         return 0
 
     if not args.apply:
         print_plan(current, desired, args.region, role_name, bucket_specs,
-                   args.kms_key_arn)
+                   args.kms_key_arn, policy_name)
         return 1
 
     iam.put_role_policy(
         RoleName=role_name,
-        PolicyName=INLINE_POLICY_NAME,
+        PolicyName=policy_name,
         PolicyDocument=json.dumps(desired),
     )
     print(f"[OK] {'Created' if current is None else 'Updated'} inline policy "
-          f"{INLINE_POLICY_NAME!r} on {role_name}.", file=sys.stderr)
+          f"{policy_name!r} on {role_name}.", file=sys.stderr)
     for bucket, mode in bucket_specs:
         print(f"     {bucket} ({mode})", file=sys.stderr)
     return 0

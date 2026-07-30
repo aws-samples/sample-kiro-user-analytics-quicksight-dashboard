@@ -27,6 +27,11 @@ KIRO_LOGS_BUCKET="${KIRO_LOGS_BUCKET#arn:aws:s3:::}"
 KIRO_LOGS_BUCKET="${KIRO_LOGS_BUCKET#s3://}"
 KIRO_LOGS_BUCKET="${KIRO_LOGS_BUCKET%/}"
 QS_IAM_ROLE_NAME="${QS_IAM_ROLE_NAME:-aws-quicksight-service-role-v0}"
+# Must match deploy.sh: the QS inline S3 policy is namespaced to STACK_PREFIX so
+# tearing down one deployment cannot delete another's grants. --revoke removes
+# the WHOLE named policy, so getting this name wrong would strip a live
+# deployment's access.
+QS_S3_POLICY_NAME="${QS_S3_POLICY_NAME:-${STACK_PREFIX}-QuickSightS3Access}"
 DATA_STACK="${STACK_PREFIX}-data"
 QS_STACK="${STACK_PREFIX}-qs"
 IDMAP_STACK="${STACK_PREFIX}-identity-map"
@@ -183,6 +188,7 @@ if [[ -n "${KIRO_LOGS_BUCKET}" ]]; then
 fi
 python3 "${ROOT}/scripts/grant_quicksight_s3.py" --revoke \
     --role-name "${QS_IAM_ROLE_NAME}" \
+    --policy-name "${QS_S3_POLICY_NAME}" \
     --region "${REGION}" \
     --buckets "${REVOKE_BUCKETS[@]}" 2>&1 | sed 's/^/   /' || \
     echo "   skipped (custom QS service role or policy not found)"

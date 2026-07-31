@@ -1121,7 +1121,8 @@ def _table(visual_id: str, title: str, dataset: str,
 
 def _pivot(visual_id: str, title: str, dataset: str,
            row_col: str, date_col: str, value_col: str,
-           agg: str = "SUM", row_sort_desc_by_value: bool = True):
+           agg: str = "SUM", row_sort_desc_by_value: bool = True,
+           extra_row_cols: list[str] | None = None):
     """Pivot table: one ROW per `row_col`, one COLUMN per day of `date_col`,
     `value_col` aggregated in the cells - i.e. a spreadsheet-style crosstab.
 
@@ -1130,6 +1131,13 @@ def _pivot(visual_id: str, title: str, dataset: str,
     date, so 300 users x 30 days is 9,000 rows to scroll, while the pivot is
     300 rows x 30 columns with the user named once. Row and column totals give
     the per-user period total and the per-day all-user total for free.
+
+    `extra_row_cols` adds further row fields beside `row_col` - used to carry
+    the Identity Center join key so this grid can be cross-referenced against an
+    external roster. Without it the export identifies users only by
+    `user_label`, a display name that does NOT appear in Kiro's own
+    subscriptions export, leaving nothing to join on. `row_col` stays first so
+    it remains the primary row grouping.
     """
     return {
         "PivotTableVisual": {
@@ -1143,7 +1151,12 @@ def _pivot(visual_id: str, title: str, dataset: str,
                                 "FieldId": f"{visual_id}-r",
                                 "Column": {"DataSetIdentifier": dataset, "ColumnName": row_col},
                             },
-                        }],
+                        }] + [{
+                            "CategoricalDimensionField": {
+                                "FieldId": f"{visual_id}-r{i}",
+                                "Column": {"DataSetIdentifier": dataset, "ColumnName": col},
+                            },
+                        } for i, col in enumerate(extra_row_cols or [])],
                         "Columns": [{
                             "DateDimensionField": {
                                 "FieldId": f"{visual_id}-c",
@@ -1430,8 +1443,16 @@ def build_definition(account_id: str, region: str, resource_prefix: str,
                 # Reads `base` rather than the gap-filled `dense` dataset: base
                 # has rows only for days a user was actually active, so the grid
                 # is not padded with zero columns for idle days.
+                # Carry idc_username alongside user_label (when identity mapping
+                # is on) so an export of THIS grid can be joined to an external
+                # roster. user_label is a display name and is absent from Kiro's
+                # own subscriptions export, so on its own it gives an admin
+                # nothing to match against - the same reason the All-users table
+                # above carries the join keys. Username only, not email too: one
+                # extra row field keeps the crosstab scannable.
                 _sub(_pivot("p-user-daily", "Daily credits used (by user)",
-                            "base", "user_label", "activity_date", "credits_used"),
+                            "base", "user_label", "activity_date", "credits_used",
+                            extra_row_cols=(["idc_username"] if identity_mapping else [])),
                      "Credits used per user per day for the selected date range - users down, dates across. Highest-consuming users first; 'Period total' is each user's total for the range and 'All users' is that day's total. Use the visual's menu (top-right) > Export to CSV to download the grid."),
                 _sub(_pie_count("p-segments", "Engagement segments (selected range)", "base", "segment_calc", "user_id"),
                      "Active users in the selected date range split by intensity: Power (≥20 active days or ≥1000 messages) / Active (≥8 days) / Light (≥1 day). Recomputes as you change the date range above - pick a month to segment that period's users."),

@@ -18,7 +18,9 @@
 --  model_name, messages), messages > 0 only.
 CREATE OR REPLACE VIEW ${database}.model_usage AS
 SELECT
-    CAST(m.date AS date)                            AS activity_date,
+    -- TRY for the same reason as base_user_activity: one unparseable date cell
+    -- in a customer export would otherwise throw and fail this view outright.
+    TRY(CAST(m.date AS date))                       AS activity_date,
     m.userid                                        AS user_id,
     COALESCE(d.user_label, m.userid)                AS user_label,
     upper(m.client_type)                            AS client_type,
@@ -27,4 +29,5 @@ SELECT
     COALESCE(TRY(CAST(m.messages AS bigint)), 0)    AS messages
 FROM ${database}.report_models m
 LEFT JOIN ${database}.user_dim d ON d.user_id = m.userid
-WHERE COALESCE(TRY(CAST(m.messages AS bigint)), 0) > 0;
+WHERE COALESCE(TRY(CAST(m.messages AS bigint)), 0) > 0
+  AND TRY(CAST(m.date AS date)) IS NOT NULL;

@@ -181,7 +181,12 @@ def _to_int(value: str) -> int:
         return 0
     try:
         return max(0, int(float(v)))  # tolerate "12.0" style floats
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
+        # OverflowError matters: float("inf") / "1e400" parse fine as floats but
+        # int() of them raises, and an escaping exception here aborts the whole
+        # run - not just this file - leaving every later file unprocessed on
+        # every future run (the source ETag never changes, so it never
+        # self-heals). Treat a non-finite count as garbage, like any other.
         return 0
 
 

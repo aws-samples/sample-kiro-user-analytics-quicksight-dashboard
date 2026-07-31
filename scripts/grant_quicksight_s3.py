@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 
 import boto3
@@ -76,8 +77,26 @@ MODES = {
 }
 
 
+# Bucket-name syntax (same rule as build_views._S3_NAME_RE): lower-case
+# alphanumeric, dots and hyphens, 3-63 chars, must start and end alphanumeric.
+# Validated HERE because this function is the single choke point every caller
+# passes through, and because the name is interpolated straight into an IAM
+# Resource ARN below. Without it, KIRO_LOGS_BUCKET='*' (or 's3://*', which a
+# shell can produce from an unquoted glob) rendered
+#   arn:aws:s3:::*  +  arn:aws:s3:::*/*
+# granting the QuickSight service role GetObject on EVERY object in the account.
+# That grant is worse than a deploy-time mistake: it lands on a role assumed by
+# QuickSight rather than by the deployer, it persists after the deploy exits,
+# and it is shared by every QuickSight principal in the account.
+_BUCKET_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]$")
+
+
 def parse_bucket_specs(specs: list[str]) -> list[tuple[str, str]]:
-    """Parse `name:mode` pairs (mode optional, defaults to `read`)."""
+    """Parse `name:mode` pairs (mode optional, defaults to `read`).
+
+    Rejects anything that is not a syntactically valid S3 bucket name, so a
+    wildcard or a typo can never widen the rendered IAM policy.
+    """
     out = []
     for s in specs:
         name, _, mode = s.partition(":")
@@ -85,6 +104,14 @@ def parse_bucket_specs(specs: list[str]) -> list[tuple[str, str]]:
         if mode not in MODES:
             raise SystemExit(f"Unknown access mode {mode!r} for bucket {name!r}. "
                              f"Use one of: {', '.join(MODES)}.")
+        if not _BUCKET_NAME_RE.match(name):
+            raise SystemExit(
+                f"Refusing to build an IAM policy for {name!r}: not a valid S3 "
+                f"bucket name. Expected 3-63 lower-case alphanumeric characters, "
+                f"dots or hyphens, starting and ending alphanumeric. A wildcard "
+                f"or malformed name here would grant QuickSight access to buckets "
+                f"you did not intend."
+            )
         out.append((name, mode))
     return out
 

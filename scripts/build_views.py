@@ -596,8 +596,11 @@ def main() -> int:
             #   *_row  - the per-row tier column
             #   *_user - the per-user CURRENT tier (most recent activity day)
             tier_label_row=tier_label_expr("subscription_tier"),
+            # Order by the CAST date, not the raw `date` varchar: a non-ISO
+            # export format would sort lexically ('9/1/2026' > '10/1/2026') and
+            # pick the wrong "most recent" tier. Matches user_dim.
             tier_label_user=tier_label_expr(
-                "max_by(COALESCE(subscription_tier, ''), date)"
+                "max_by(COALESCE(subscription_tier, ''), TRY(CAST(date AS date)))"
                 " OVER (PARTITION BY userid)"
             ),
             tier_label_dim=tier_label_expr("subscription_tier_raw"),

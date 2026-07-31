@@ -23,13 +23,24 @@ CREATE OR REPLACE VIEW ${database}.user_dim AS
 WITH email_per_user AS (
     SELECT
         userid                                 AS user_id,
-        -- One representative email per user - the most-recent non-empty one.
-        MAX(${email_expr})                     AS email,
+        -- The most-recent non-empty email, via max_by - NOT a lexical MAX.
+        -- MAX(email) returned the alphabetically-largest address, so after a
+        -- rename (zeta@ -> alpha@) user_dim kept the STALE one indefinitely, and
+        -- because user_label falls back to email the dashboard showed the old
+        -- identity forever. Under --hash-emails it was worse: a lexical max over
+        -- sha256 digests is effectively random with respect to recency.
+        -- NULLIF first so a blank never outranks a real address.
+        max_by(NULLIF(${email_expr}, ''),
+               TRY(CAST(date AS date)))        AS email,
         -- Most-recent tier (the user's CURRENT plan), not a lexical MAX:
         -- max_by picks the subscription_tier from the user's latest-dated row,
         -- so an upgrade (e.g. Pro+ -> Power) shows immediately. A plain MAX
         -- ranked 'PRO_PLUS' above 'POWER' alphabetically and hid upgrades.
-        max_by(subscription_tier, date)        AS subscription_tier_raw
+        -- Order by the CAST date, not the raw string: `date` is a varchar here,
+        -- so a non-ISO export format (e.g. M/D/YYYY) would sort '9/1/2026' above
+        -- '10/1/2026' and silently resurrect exactly the bug described above.
+        max_by(subscription_tier,
+               TRY(CAST(date AS date)))        AS subscription_tier_raw
     FROM ${database}.report_facts
     GROUP BY userid
 )

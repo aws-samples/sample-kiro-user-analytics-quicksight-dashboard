@@ -22,7 +22,12 @@
 -- (the DrillUser parameter depends on that).
 CREATE OR REPLACE VIEW ${database}.base_user_activity AS
 SELECT
-    CAST(date AS date)                                AS activity_date,
+    -- TRY, like every other cast below: `date` is a string in report_facts and
+    -- comes from a customer bucket, so a single unparseable cell would otherwise
+    -- throw INVALID_CAST_ARGUMENT and hard-fail not just this view but all nine
+    -- that read it - a total dashboard outage from one bad row. The WHERE below
+    -- drops the offending row instead.
+    TRY(CAST(date AS date))                           AS activity_date,
     userid                                            AS user_id,
     COALESCE(${email_expr}, '')                       AS email,
     ${base_user_label}                                AS user_label,
@@ -52,4 +57,8 @@ SELECT
     COALESCE(TRY(CAST(overage_credits_used AS double)), 0.0) AS overage_credits_used,
     COALESCE(TRY(CAST(overage_enabled    AS boolean)), false) AS overage_enabled
 FROM ${database}.report_facts
-${base_identity_join};
+${base_identity_join}
+-- Drop rows whose date could not be parsed (see the TRY above). Every
+-- downstream view keys on activity_date, so a NULL here would silently
+-- misgroup or vanish in joins; excluding it is both safer and honest.
+WHERE TRY(CAST(date AS date)) IS NOT NULL;

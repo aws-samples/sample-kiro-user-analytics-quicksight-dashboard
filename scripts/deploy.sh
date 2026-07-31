@@ -37,6 +37,17 @@
 
 set -euo pipefail
 
+# Neutralise two AWS CLI config settings that break non-interactive scripting:
+#   cli_pager  - a configured pager can block on a captured $(aws ...) call
+#   cli_auto_prompt = on - makes every capture fail with "Input is not a
+#                          terminal (fd=0) / [Errno 22] Invalid argument" and
+#                          exit 255, which under `set -e` kills the script with
+#                          no usable diagnostic.
+# Both live in the user's ~/.aws/config, so a correct script can fail purely
+# because of how the operator configured their CLI.
+export AWS_PAGER=""
+export AWS_CLI_AUTO_PROMPT=off
+
 REGION="${AWS_REGION:-us-east-1}"
 STACK_PREFIX="${STACK_PREFIX:-kiro-analytics}"
 HASH_EMAILS="${HASH_EMAILS:-false}"
@@ -65,6 +76,22 @@ WORKGROUP_NAME="${WORKGROUP_NAME:-${STACK_PREFIX//-/_}}"
 
 : "${KIRO_LOGS_BUCKET:?Set KIRO_LOGS_BUCKET to the bucket Kiro exports to}"
 : "${QS_PRINCIPAL_ARN:?Set QS_PRINCIPAL_ARN to the QuickSight user/group ARN that should own the dashboard}"
+
+# Validate STACK_PREFIX up front, in the customer's own vocabulary. It flows
+# into S3 bucket names, the Glue database, the Athena workgroup, IAM policy
+# names and CFN stack names, so an invalid value otherwise fails deep into a
+# multi-stack deploy with an error naming a parameter the customer never set
+# (e.g. STACK_PREFIX=Kiro-Prod -> DATABASE_NAME=Kiro_Prod -> rejected by the
+# DatabaseName AllowedPattern). 20 chars keeps
+# "<prefix>-data-athena-results-<12-digit-account>-<region>" inside the 63-char
+# S3 bucket-name limit for the longest common region names.
+if ! printf '%s' "${STACK_PREFIX}" | grep -Eq '^[a-z][a-z0-9-]{0,19}$'; then
+    echo ">> ERROR: STACK_PREFIX must start with a lower-case letter and contain" >&2
+    echo "   only lower-case letters, digits and hyphens (max 20 chars), because" >&2
+    echo "   it is used to build S3 bucket and AWS Glue database names." >&2
+    echo "   Got: '${STACK_PREFIX}'" >&2
+    exit 1
+fi
 
 # Accept name, ARN (arn:aws:s3:::name), or s3:// URI for KIRO_LOGS_BUCKET. CFN
 # parameters and the IAM policy renderer below need the bare bucket name.
@@ -595,6 +622,29 @@ python3 "${ROOT}/scripts/create_dashboard.py" \
     ${THEME_ARN:+--theme-arn "${THEME_ARN}"} \
     ${IDMAP_BUCKET:+--identity-mapping}
 
+# --- SPICE dataset inventories -----------------------------------------------
+# Declared ONCE here because both the identity-mapping-ON refresh (6b) and the
+# opt-out purge (7) previously carried their own hardcoded copies, and both had
+# drifted from cfn/02-quicksight.yaml: the purge list still named the deleted
+# `cohort-retention` (a silent 404) and BOTH lists omitted `user-daily-dense`,
+# which carries user_label. That omission meant `IDENTITY_MAPPING=false` printed
+# "Identity mapping fully removed" while real names stayed in that dataset's
+# SPICE data - a privacy failure with a clean exit code.
+#
+# KEEP IN SYNC WITH cfn/02-quicksight.yaml. If you add a DataSet there, add it
+# to QS_ALL_DATASETS; if its view selects user_label, add it to
+# QS_LABEL_DATASETS too (QS_LABEL_DATASETS must be a subset of QS_ALL_DATASETS).
+QS_ALL_DATASETS=(
+    base-user-activity daily-trends user-totals tier-breakdown engagement
+    model-usage wow-movers period-comparison activity-heatmap user-daily-dense
+)
+# The subset whose views resolve user_label (verified against the InputColumns
+# in cfn/02-quicksight.yaml). These are the only ones that can hold PII.
+QS_LABEL_DATASETS=(
+    base-user-activity user-totals engagement model-usage wow-movers
+    user-daily-dense
+)
+
 # 6b) When identity mapping is ON, force a SPICE refresh of the datasets whose
 # views resolve user_label. The QS datasets are SPICE import mode, so a view
 # that now returns names does NOT change the dashboard until the data is
@@ -603,10 +653,10 @@ python3 "${ROOT}/scripts/create_dashboard.py" \
 # ALREADY-deployed dashboard leaves stack 02 with "no changes", so without this
 # the names would not show until the next daily 04:00 refresh. Only the
 # datasets whose views carry user_label are refreshed (cheap + sufficient);
-# funnel/cohort join user_dim for tier only, so they are unaffected.
+# the rest join user_dim for tier only, so they are unaffected.
 if [[ -n "${IDMAP_BUCKET}" ]]; then
     echo ">> Refreshing SPICE for identity-resolved datasets"
-    for ds in base-user-activity user-totals engagement wow-movers model-usage; do
+    for ds in "${QS_LABEL_DATASETS[@]}"; do
         # Best-effort: a busy/refreshing dataset returns an error we ignore -
         # its daily schedule will pick up the new data regardless.
         aws quicksight create-ingestion --region "${REGION}" \
@@ -625,12 +675,10 @@ fi
 # infrastructure entirely.
 if [[ -n "${PURGE_IDMAP}" ]]; then
     echo ">> Purging resolved names from SPICE (full refresh of all datasets)"
-    DATASETS=(
-        base-user-activity daily-trends user-totals tier-breakdown engagement
-        model-usage wow-movers period-comparison cohort-retention
-        activity-heatmap
-    )
-    for ds in "${DATASETS[@]}"; do
+    # Every dataset, not just the label-carrying subset: a full refresh is cheap
+    # and re-ingesting all of them is the safest way to guarantee no resolved
+    # name survives anywhere in SPICE.
+    for ds in "${QS_ALL_DATASETS[@]}"; do
         # Best-effort: a single dataset failing to ingest must not stop the
         # purge of the rest or the stack teardown.
         aws quicksight create-ingestion --region "${REGION}" \

@@ -21,7 +21,11 @@ recent AS (
         COUNT(DISTINCT b.activity_date) AS active_days_30d,
         SUM(b.total_messages)           AS messages_30d
     FROM ${database}.base_user_activity b, window_bound w
-    WHERE b.activity_date >= date_add('day', -30, w.max_date)
+    -- STRICT `>`: max_date is inclusive, so `>= -30` spanned 31 days. The
+    -- columns are named *_30d and the `>= 20 active days` Power threshold below
+    -- is calibrated against a 30-day month, so the extra day handed every user
+    -- one more chance to qualify and inflated the Power bucket.
+    WHERE b.activity_date > date_add('day', -30, w.max_date)
     GROUP BY b.user_id
 ),
 ever_seen AS (

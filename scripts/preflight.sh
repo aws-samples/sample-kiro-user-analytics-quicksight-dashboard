@@ -5,6 +5,17 @@
 
 set -uo pipefail
 
+# Neutralise two AWS CLI config settings that break non-interactive scripting:
+#   cli_pager  - a configured pager can block on a captured $(aws ...) call
+#   cli_auto_prompt = on - makes every capture fail with "Input is not a
+#                          terminal (fd=0) / [Errno 22] Invalid argument" and
+#                          exit 255, which under `set -e` kills the script with
+#                          no usable diagnostic.
+# Both live in the user's ~/.aws/config, so a correct script can fail purely
+# because of how the operator configured their CLI.
+export AWS_PAGER=""
+export AWS_CLI_AUTO_PROMPT=off
+
 REGION="${AWS_REGION:-us-east-1}"
 STACK_PREFIX="${STACK_PREFIX:-kiro-analytics}"
 KIRO_LOGS_BUCKET="${KIRO_LOGS_BUCKET:-}"
@@ -171,7 +182,8 @@ echo "[6/6] QuickSight S3 access"
 if [[ -n "${ACCOUNT_ID}" ]]; then
     cat <<EOF
   [INFO] QuickSight S3 access is granted at deploy time by attaching an
-         inline IAM policy ('KiroAnalyticsQuickSightS3Access') to the QS
+         inline IAM policy ('${STACK_PREFIX}-QuickSightS3Access' for this
+         STACK_PREFIX; the name is namespaced per deployment) to the QS
          service role. It does NOT need to be pre-configured in the QS
          console. The deploy script will prompt before writing the policy.
          Reference: https://repost.aws/knowledge-center/quicksight-permission-errors

@@ -18,6 +18,17 @@
 
 set -uo pipefail
 
+# Neutralise two AWS CLI config settings that break non-interactive scripting:
+#   cli_pager  - a configured pager can block on a captured $(aws ...) call
+#   cli_auto_prompt = on - makes every capture fail with "Input is not a
+#                          terminal (fd=0) / [Errno 22] Invalid argument" and
+#                          exit 255, which under `set -e` kills the script with
+#                          no usable diagnostic.
+# Both live in the user's ~/.aws/config, so a correct script can fail purely
+# because of how the operator configured their CLI.
+export AWS_PAGER=""
+export AWS_CLI_AUTO_PROMPT=off
+
 REGION="${AWS_REGION:-us-east-1}"
 STACK_PREFIX="${STACK_PREFIX:-kiro-analytics}"
 KIRO_LOGS_BUCKET="${KIRO_LOGS_BUCKET:-}"

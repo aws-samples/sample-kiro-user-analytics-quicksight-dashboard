@@ -1520,7 +1520,7 @@ def build_definition(account_id: str, region: str, resource_prefix: str,
             "Name": "Economics",
             "ContentType": "INTERACTIVE",
             "Visuals": [
-                _sub(_pie_count("e-users-by-tier", "Users by tier", "base", "subscription_tier", "user_id"),
+                _sub(_pie_count("e-users-by-tier", "Users by tier", "base", "user_tier", "user_id"),
                      "Distinct users active in each tier (Pro / Pro+ / Pro Max / Power) within the selected window."),
                 # Stacked: in-plan (calc, no agg) + overage (summed) per tier.
                 _sub({
@@ -1532,10 +1532,17 @@ def build_definition(account_id: str, region: str, resource_prefix: str,
                             "Orientation": "VERTICAL",
                             "FieldWells": {
                                 "BarChartAggregatedFieldWells": {
+                                    # user_tier, like every other Economics
+                                    # visual: this one SUMS credits so it never
+                                    # double-counted, but grouping it on the
+                                    # per-row tier while the donut and table
+                                    # beside it group on the per-user tier would
+                                    # split one user's credits across two bars
+                                    # and make the sheet internally inconsistent.
                                     "Category": [{
                                         "CategoricalDimensionField": {
                                             "FieldId": "e-credits-by-tier-c",
-                                            "Column": {"DataSetIdentifier": "base", "ColumnName": "subscription_tier"},
+                                            "Column": {"DataSetIdentifier": "base", "ColumnName": "user_tier"},
                                         },
                                     }],
                                     "Values": [
@@ -1566,13 +1573,13 @@ def build_definition(account_id: str, region: str, resource_prefix: str,
                         },
                     },
                 }, "Credits per tier in the selected window, split into in-plan vs overage. A tall overage section = candidates for a tier upgrade."),
-                _sub(_bar_calc("e-credits-per-user",    "Credits per user (by tier)",    "base", "subscription_tier", "credits_per_user_calc"),
+                _sub(_bar_calc("e-credits-per-user",    "Credits per user (by tier)",    "base", "user_tier", "credits_per_user_calc"),
                      "Credits consumed per active user in the window, by tier. Shows whether each tier's users are using their plan fully."),
-                _sub(_bar_calc("e-credits-per-message", "Credits per message (by tier)", "base", "subscription_tier", "credits_per_message_calc"),
+                _sub(_bar_calc("e-credits-per-message", "Credits per message (by tier)", "base", "user_tier", "credits_per_message_calc"),
                      "Credits per message - proxy for cost-per-interaction. Higher = users picking heavier models or longer chats."),
                 _sub(_table("e-unit-econ-table", "Unit economics by tier",
                        "base",
-                       dimensions=["subscription_tier"],
+                       dimensions=["user_tier"],
                        values=[
                            ("active_users_calc",        None),
                            ("total_messages",           "SUM"),
@@ -1981,12 +1988,19 @@ def build_definition(account_id: str, region: str, resource_prefix: str,
         ("models",     ["activity", "people", "user-detail"]),
     ]
     for dataset_id, sheet_ids in tier_filtered_datasets:
+        # Filter the SAME column the visuals group by. `base` exposes both a
+        # per-row subscription_tier and a per-user-constant user_tier, and every
+        # base-backed visual groups by user_tier, so filtering base on the
+        # per-row column would let a mid-window tier changer appear under a tier
+        # the picker did not select. The other datasets have only
+        # subscription_tier (already one value per row at their grain).
+        tier_col = "user_tier" if dataset_id == "base" else "subscription_tier"
         filter_groups.append({
             "FilterGroupId": f"fg-tier-{dataset_id}",
             "Filters": [{
                 "CategoryFilter": {
                     "FilterId": f"f-tier-{dataset_id}",
-                    "Column": {"DataSetIdentifier": dataset_id, "ColumnName": "subscription_tier"},
+                    "Column": {"DataSetIdentifier": dataset_id, "ColumnName": tier_col},
                     "Configuration": {
                         "CustomFilterConfiguration": {
                             "MatchOperator": "EQUALS",
@@ -2097,12 +2111,21 @@ def build_definition(account_id: str, region: str, resource_prefix: str,
     # Same base-backed People visuals also honor the Tier picker. The tier
     # filter group for `base` (above) is scoped to economics only; add these
     # explicitly so the Tier control works against the base-backed table/donut.
+    #
+    # Filter on user_tier, NOT subscription_tier: the All-users table GROUPS by
+    # user_tier (the per-user constant), so filtering on the per-row column made
+    # the two disagree for anyone who changed tier mid-window. Selecting
+    # Tier = Pro returned 8 rows whose tier column read "Pro+" - a user keeps
+    # any row whose per-row tier matched, but the row is then labelled with
+    # their current tier. Filtering and displaying the same column makes the
+    # grid self-consistent: pick Pro, get exactly the users whose current tier
+    # is Pro, with their whole windowed usage.
     filter_groups.append({
         "FilterGroupId": "fg-tier-people-base",
         "Filters": [{
             "CategoryFilter": {
                 "FilterId": "f-tier-people-base",
-                "Column": {"DataSetIdentifier": "base", "ColumnName": "subscription_tier"},
+                "Column": {"DataSetIdentifier": "base", "ColumnName": "user_tier"},
                 "Configuration": {
                     "CustomFilterConfiguration": {
                         "MatchOperator": "EQUALS",

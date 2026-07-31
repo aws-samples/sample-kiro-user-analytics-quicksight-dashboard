@@ -392,10 +392,33 @@ def render_identity_label_parts(database: str, email_expr: str, enabled: bool) -
     QuickSight DataSet declares these columns unconditionally, and a missing
     column would break SPICE ingestion.
     """
+    # `email` is a PER-ROW column, but user_label is used as a PER-USER IDENTITY:
+    # it is the DrillUser parameter key, the All-users table's grouping key, and
+    # a GROUP BY key in user_daily_dense. If it varies across a user's rows they
+    # split into several table rows, each holding a partial share of their
+    # credits - the same failure the per-user-constant `user_tier` column exists
+    # to prevent, and the same symptom a customer reported for tiers.
+    #
+    # It is not hypothetical: `email` arrived in the April-2026 export and is
+    # blank before it, so any tenant whose history straddles that rollout has a
+    # mixed population. Simulated on 385 synthetic users, the per-row form
+    # produced 731 table rows and split 348 users (90%), and because DrillUser
+    # binds a single label the User-detail sheet showed ~58% of a user's
+    # messages with no indication anything was missing.
+    #
+    # Fix: collapse email to ONE value per user (their most recent non-empty
+    # address) before it reaches the label, so the label is constant per user by
+    # construction. Nested inside COALESCE, so the uuid fallback is unaffected.
+    base_email_const = (
+        f"max_by(NULLIF({email_expr}, ''), TRY(CAST(date AS date)))"
+        f" OVER (PARTITION BY userid)"
+    )
     if not enabled:
         return {
-            "base_user_label": f"COALESCE(NULLIF({email_expr}, ''), userid)",
+            "base_user_label": f"COALESCE({base_email_const}, userid)",
             "base_identity_join": "",
+            # user_dim already aggregates to one row per user, so its `email` is
+            # a single value by construction - no window function needed here.
             "dim_user_label": "COALESCE(NULLIF(email, ''), user_id)",
             "dim_identity_join": "",
             "dim_idc_username": "CAST(NULL AS varchar)",
@@ -415,8 +438,12 @@ def render_identity_label_parts(database: str, email_expr: str, enabled: bool) -
     # the rest of the (internally consistent) views and the DrillUser parameter
     # are unaffected.
     return {
+        # Same per-user-constant email as the mapping-off branch (see the
+        # comment above base_email_const). The im.* columns come from a join
+        # that is already collapsed to one row per idc_user_id, so they are
+        # per-user constant by construction; only `email` needed the window.
         "base_user_label": (
-            f"COALESCE(NULLIF(im.idc_display_name, ''), NULLIF({email_expr}, ''), "
+            f"COALESCE(NULLIF(im.idc_display_name, ''), {base_email_const}, "
             f"NULLIF(im.idc_username, ''), userid)"
         ),
         "base_identity_join": (

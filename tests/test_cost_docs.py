@@ -3,22 +3,29 @@
 A wrong number in a cost table is worse than no cost table: someone budgets from
 it. The figures were measured against live deployments and verified against the
 AWS Price List API, but nothing stops a later edit from changing one cell and
-leaving the rest — so the licence table is recomputed here from the unit prices
+leaving the rest - so the licence table is recomputed here from the unit prices
 the section itself states.
 
-This does NOT check AWS's prices (they change, and a test that fails when AWS
-reprices would be noise). It checks that the README is consistent with itself:
-if the stated per-user prices don't produce the stated totals, one of them is
-wrong.
+KNOWN LIMIT of everything in this file: it only reads the README, so it catches
+internal INCONSISTENCY and never STALENESS. If AWS reprices a reader tomorrow,
+every test here still passes while the whole Cost section is wrong. Nothing
+offline can detect that, so the mitigations are elsewhere and deliberate: the
+figures are labelled us-east-1 list price, the authoritative pages are linked,
+and `scripts/check_pricing.py` diffs the documented prices against the live
+Price List API at each release (it needs credentials, so it cannot run in CI -
+and failing a contributor's PR because AWS changed a price would be noise).
+The tests at the bottom of this file at least keep that script and the README
+from drifting apart.
 """
 from __future__ import annotations
 
 import re
 import unittest
 
-from _helpers import REPO
+from _helpers import REPO, SCRIPTS
 
 README = (REPO / "README.md").read_text()
+CHECKER = (SCRIPTS / "check_pricing.py").read_text()
 
 
 def cost_section() -> str:
@@ -123,6 +130,52 @@ class TestCostSectionIsLinked(unittest.TestCase):
         away and the figures must be labelled as list price."""
         self.assertIn("aws.amazon.com/quicksight/pricing", SECTION)
         self.assertRegex(SECTION, r"(?i)list price")
+
+    def test_staleness_is_disclosed_with_a_way_to_recheck(self):
+        """The honest hedge for the limit described in this module's docstring:
+        a reader must be told the numbers can age, and handed the command that
+        re-verifies them."""
+        self.assertRegex(SECTION, r"(?i)stale")
+        self.assertIn("scripts/check_pricing.py", SECTION)
+
+
+class TestPricingCheckerStaysInSyncWithTheDocs(unittest.TestCase):
+    """The offline tests cannot see AWS repricing; check_pricing.py can. That
+    only helps if the two agree on the numbers, so pin them together - otherwise
+    the release check silently validates prices the README no longer states."""
+
+    def _expected(self) -> dict[str, float]:
+        block = CHECKER.split("EXPECTED = {", 1)[1].split("}", 1)[0]
+        return {label: float(price) for label, price in
+                re.findall(r'\("([^"]+)",\s*([\d.]+)\)', block)}
+
+    def test_checker_declares_the_prices_the_readme_uses(self):
+        expected = self._expected()
+        self.assertTrue(expected, "could not parse EXPECTED from check_pricing.py")
+        for name, price in (("Reader", 3.0), ("fee", 250.0)):
+            match = [v for k, v in expected.items() if name.lower() in k.lower()]
+            with self.subTest(price=name):
+                self.assertIn(price, match,
+                              f"check_pricing.py does not expect ${price} for {name}; "
+                              f"it and the README's Cost section have drifted")
+
+    def test_checker_is_not_wired_into_offline_checks(self):
+        """It needs credentials and network. In run-checks.sh it would fail for
+        every contributor without AWS access, and in CI it would fail fork PRs -
+        so the release process calls it, not the test suite."""
+        self.assertNotIn("check_pricing", (SCRIPTS / "run-checks.sh").read_text())
+
+    def test_the_release_process_calls_it(self):
+        """A check nobody runs is not a mitigation."""
+        contributing = (REPO / "CONTRIBUTING.md").read_text()
+        self.assertIn("scripts/check_pricing.py", contributing)
+
+    def test_unverifiable_figures_are_declared_rather_than_skipped(self):
+        """The Price List API publishes no SKU for the plain Author price, so
+        the script must SAY so instead of quietly checking a subset and
+        implying the whole section was validated."""
+        self.assertIn("NOT_IN_API", CHECKER)
+        self.assertRegex(CHECKER, r"(?i)author")
 
 
 if __name__ == "__main__":

@@ -48,7 +48,12 @@ A contributor does **not** need to bump it — maintainers do that when cutting 
 
 1. Update `VERSION`.
 2. Add a matching section to [`CHANGELOG.md`](./CHANGELOG.md). A test enforces that the current `VERSION` has an entry, so a bump without a changelog entry fails CI.
-3. Tag the release `v<version>`.
+3. Re-check the documented prices against AWS:
+   ```bash
+   python3 scripts/check_pricing.py
+   ```
+   This needs credentials and network, so it is **not** part of CI. `tests/test_cost_docs.py` recomputes the README's cost table from the unit prices the section itself states — which catches a stale cell, but *cannot* catch AWS repricing: if the reader price changes, every offline test still passes while the whole Cost section is wrong. This script is the only thing that closes that gap, so run it at each release. It exits non-zero on drift and names the figures it could not verify (the Price List API publishes no SKU for the plain Author price).
+4. Tag the release `v<version>`.
 
 Choose the bump by what it costs the person upgrading, not by how large the diff is:
 

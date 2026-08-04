@@ -129,6 +129,8 @@ Most visuals respond to the date-range picker, but one uses a **fixed window** b
    * **IDC_REGION** (default `AWS_REGION`): The AWS Region IAM Identity Center lives in. It can differ from the dashboard region (for example, Identity Center in `eu-west-1` while the data and dashboard are in `us-east-1`).
    * **IDC_ROLE_ARN** (default empty): Optional. ARN of a role to assume when IAM Identity Center lives in a different AWS account (the organization management or a delegated-admin account). Leave empty for same-account Identity Center.
    * **IDENTITY_MAP_REFRESH_SCHEDULE** (default `cron(30 3 * * ? *)`): EventBridge schedule for the daily identity-map refresh (03:30 UTC, after the 03:15 report normalizer and before the 04:00 SPICE refresh).
+   * **ALARM_EMAIL** (default empty — no alarms): **Strongly recommended.** Email address to notify if the report-normalizer fails or stops running. The pipeline deliberately fails *closed* — if normalization breaks, the previous data stays in place and the dashboard keeps serving it — so without an alarm a broken pipeline is indistinguishable from a quiet day, and the only symptom is a date that quietly stops advancing. Setting this creates an SNS topic and two CloudWatch alarms: one on Lambda errors, and one that fires if the function has not run in 26 hours (a disabled schedule produces no errors at all, so an error alarm alone cannot catch it). **AWS sends a subscription-confirmation email that you must accept before any notification is delivered.** See [Monitoring](#monitoring).
+   * **LOG_RETENTION_DAYS** (default `30`): CloudWatch Logs retention for the normalizer. Without an explicit log group, Lambda creates one that never expires, which accrues cost indefinitely and retains diagnostic output (object keys, AWS error strings) forever.
 
 3. Run the preflight check.
 
@@ -301,6 +303,37 @@ aws sso-admin list-instances --query 'Instances[].IdentityStoreId' --output text
 * `IDENTITY_MAPPING` and `HASH_EMAILS` are mutually exclusive - resolving users to real names while hashing their email is contradictory, and the deploy script refuses to run with both set.
 
 **Turning it off.** Re-run `scripts/deploy.sh` with `IDENTITY_MAPPING=false` (the default). The deploy rebuilds the views without the join, forces a SPICE refresh so resolved names are flushed from memory, empties and deletes the identity-map bucket, and removes the `<prefix>-identity-map` stack. (Its KMS key is retained - see Cleaning up.)
+
+## Monitoring
+
+Set **`ALARM_EMAIL`** at deploy time. It is optional only so that the stack can be deployed without it; in practice you want it.
+
+The pipeline is deliberately **fail-closed**: if normalization breaks, the previous normalized output stays in place and the dashboard keeps serving it. That protects the data, but it also means a broken pipeline looks exactly like a quiet week — no error appears anywhere, and the only symptom is a most-recent date that stops advancing. `ALARM_EMAIL` is what turns that silence into a notification.
+
+Setting it creates one SNS topic and two CloudWatch alarms:
+
+| Alarm | Fires when | Catches |
+|---|---|---|
+| `<prefix>-data-normalizer-errors` | Lambda `Errors` ≥ 1 in 5 minutes | A malformed source export, an unhandled exception, or a timeout. The normalizer isolates a bad file and processes the rest, then fails the invocation so this alarm can see it. |
+| `<prefix>-data-normalizer-not-running` | `Invocations` < 1 over 26 hours | The function never ran — a disabled EventBridge rule, a removed trigger, a permission regression. This produces **zero errors**, so the error alarm alone cannot detect it. |
+
+Both alarms notify on recovery as well, so you get an explicit all-clear rather than wondering whether an issue resolved itself.
+
+**You must confirm the subscription.** AWS emails a confirmation link when the topic is created; until you accept it, the alarms work but nothing is delivered. Add further subscribers (a team alias, chat webhook, PagerDuty) to the topic ARN in the stack's `AlarmTopicArn` output.
+
+To check what an alarm is telling you:
+
+```bash
+# Which alarms are currently in ALARM?
+aws cloudwatch describe-alarms --region "$AWS_REGION" \
+    --alarm-name-prefix "<stack-prefix>-data-normalizer" \
+    --query 'MetricAlarms[].[AlarmName,StateValue,StateReason]' --output table
+
+# What failed, and on which file?
+aws logs tail "/aws/lambda/<stack-prefix>-data-normalize-report" --since 2d --region "$AWS_REGION" | grep FAILED
+```
+
+A `FAILED to normalize <key>` line names the offending object and the exception type. That file is skipped and retried on every subsequent run, so it will keep failing — and keep alarming — until the source export is corrected or removed.
 
 ## Troubleshooting
 

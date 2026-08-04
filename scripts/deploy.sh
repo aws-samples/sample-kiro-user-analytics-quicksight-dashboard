@@ -18,6 +18,14 @@
 #   THEME_MODE         - default light. Set to dark for a dark-mode dashboard.
 #   AUTO_APPROVE_IAM   - default false. Set to true to apply the QS S3 inline
 #                        policy without prompting (CI / scripted deploys).
+#   ALARM_EMAIL        - default "" (no alarms). Email to notify if the
+#                        report-normalizer fails or stops running. STRONGLY
+#                        recommended: the pipeline fails closed, so without an
+#                        alarm a broken normalizer looks like a quiet day.
+#                        AWS emails a subscription confirmation you must accept.
+#   LOG_RETENTION_DAYS - default 30. CloudWatch retention for the normalizer's
+#                        log group (without this, Lambda's auto-created group
+#                        never expires).
 #
 # Optional - IAM Identity Center user mapping (resolve the report's opaque
 # user_id GUIDs to human names). Entirely opt-in; nothing below is provisioned
@@ -59,6 +67,8 @@ IDENTITY_STORE_ID="${IDENTITY_STORE_ID:-}"
 IDC_REGION="${IDC_REGION:-}"
 IDC_ROLE_ARN="${IDC_ROLE_ARN:-}"
 IDENTITY_MAP_REFRESH_SCHEDULE="${IDENTITY_MAP_REFRESH_SCHEDULE:-cron(30 3 * * ? *)}"
+ALARM_EMAIL="${ALARM_EMAIL:-}"
+LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-30}"
 
 # AWS Glue DB and Athena workgroup names are namespaced to STACK_PREFIX so multiple
 # parallel deployments in the same account/region don't collide. AWS Glue DB names
@@ -247,7 +257,8 @@ aws cloudformation deploy \
         "KmsKeyArn=${KMS_KEY_ARN}" \
         "DatabaseName=${DATABASE_NAME}" \
         "WorkgroupName=${WORKGROUP_NAME}" \
-        "NormalizerLambdaCodeS3Key=${NRM_CODE_KEY}"
+        "NormalizerLambdaCodeS3Key=${NRM_CODE_KEY}" \
+        "AlarmEmail=${ALARM_EMAIL}"
 
 if [[ -z "${NRM_CODE_KEY}" ]]; then
     echo ">> Staging normalizer zip (first deploy) and re-deploying ${DATA_STACK}"
@@ -264,7 +275,8 @@ if [[ -z "${NRM_CODE_KEY}" ]]; then
             "KmsKeyArn=${KMS_KEY_ARN}" \
             "DatabaseName=${DATABASE_NAME}" \
             "WorkgroupName=${WORKGROUP_NAME}" \
-            "NormalizerLambdaCodeS3Key=${NRM_KEY}"
+            "NormalizerLambdaCodeS3Key=${NRM_KEY}" \
+            "AlarmEmail=${ALARM_EMAIL}"
 fi
 
 DATABASE="$(aws cloudformation describe-stacks --region "${REGION}" --stack-name "${DATA_STACK}" \
@@ -273,6 +285,30 @@ WORKGROUP="$(aws cloudformation describe-stacks --region "${REGION}" --stack-nam
     --query "Stacks[0].Outputs[?OutputKey=='AthenaWorkgroupName'].OutputValue" --output text)"
 NORMALIZER_LAMBDA="$(aws cloudformation describe-stacks --region "${REGION}" --stack-name "${DATA_STACK}" \
     --query "Stacks[0].Outputs[?OutputKey=='NormalizerLambdaName'].OutputValue" --output text 2>/dev/null || echo "")"
+
+# Set CloudWatch retention on the normalizer's log group. Done here rather than
+# as an AWS::Logs::LogGroup resource because Lambda AUTO-CREATES that group on
+# first invocation: on any already-deployed stack the group therefore exists and
+# is unmanaged, and adding it to the template fails the whole change set with
+# AWS::EarlyValidation::ResourceExistenceCheck (verified against a live stack).
+# put-retention-policy is idempotent and works whether or not the group exists
+# yet, so it covers fresh and existing deployments identically.
+#
+# Without this the auto-created group NEVER expires: unbounded cost, and
+# diagnostic output (object keys, AWS error strings) retained forever.
+if [[ -n "${NORMALIZER_LAMBDA}" ]]; then
+    NRM_LOG_GROUP="/aws/lambda/${NORMALIZER_LAMBDA}"
+    if aws logs put-retention-policy --region "${REGION}" \
+            --log-group-name "${NRM_LOG_GROUP}" \
+            --retention-in-days "${LOG_RETENTION_DAYS}" >/dev/null 2>&1; then
+        echo ">> Log retention set to ${LOG_RETENTION_DAYS}d on ${NRM_LOG_GROUP}"
+    else
+        # The group does not exist until the function has run at least once.
+        # Not fatal: the next deploy (or the line above, after the synchronous
+        # invoke below) will set it.
+        echo "   (log group not present yet; retention will be set on a later run)" >&2
+    fi
+fi
 
 # 1b) Guard against a reused-prefix / changed-bucket mismatch.
 # Re-running an existing STACK_PREFIX with a different KIRO_LOGS_BUCKET reports

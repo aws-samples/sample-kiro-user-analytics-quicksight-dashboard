@@ -394,7 +394,7 @@ responsibility model.
 | Data store | Encryption | Configured by |
 |------------|------------|---------------|
 | Kiro logs Amazon S3 bucket (source) | Customer-managed. Set SSE-S3 or SSE-KMS on the bucket; pass the KMS key ARN via `KMS_KEY_ARN` so the report-normalizer Lambda is granted `kms:Decrypt`. | Customer |
-| Athena results Amazon S3 bucket | SSE-S3 (`AES256`) by default, plus a TLS-only bucket policy. Versioning enabled. Lifecycle: `query-results/` expires after 30 days; `normalized/` (the dashboard's source data) is retained. Server access logging is opt-in (CloudTrail covers Athena API events at the account level). | This stack |
+| Athena results Amazon S3 bucket | SSE-S3 (`AES256`) by default, plus a TLS-only bucket policy. Versioning enabled. Lifecycle: `query-results/` expires after 7 days (short because those results carry resolved names/emails when identity mapping is on); `normalized/` (the dashboard's source data) is retained. Server access logging is opt-in (CloudTrail covers Athena API events at the account level). | This stack |
 | Amazon Athena query results | `EncryptionConfiguration: SSE_S3` enforced by `EnforceWorkGroupConfiguration: true` on the workgroup. | This stack |
 | Identity-map Amazon S3 bucket (only when `IDENTITY_MAPPING=true`) | SSE-KMS with a dedicated customer-managed key (rotation enabled), plus server access logging, versioning, a TLS-only bucket policy, and a 30-day noncurrent-version lifecycle. Holds resolved names/emails (PII), isolated from the rest of the solution's data. | This stack |
 | Amazon QuickSight SPICE | Encrypted at rest with service-managed keys. There is no CFN property to configure SPICE encryption; it is on by default for Enterprise edition. | Amazon QuickSight |

@@ -63,7 +63,7 @@ What the CloudFormation templates and the deployment scripts configure by defaul
 | Object ownership | Athena results bucket | `BucketOwnerEnforced` (ACLs disabled) |
 | Versioning | Athena results bucket | Enabled, with non-current expiration lifecycle |
 | Server access logging | Athena results bucket | Opt-in for the customer (CloudTrail covers Athena API events at the account level) |
-| Lifecycle expiration | Athena results bucket | `query-results/` prefix expires after 30 days (transient query scratch); the `normalized/` prefix is RETAINED (the dashboard's source data) with a 30-day noncurrent-version cap |
+| Lifecycle expiration | Athena results bucket | `query-results/` prefix expires after **7 days** - short because these results carry resolved PII when identity mapping is on (see "Containment and isolation"); the `normalized/` prefix is RETAINED (the dashboard's source data) with a 30-day noncurrent-version cap |
 | Athena workgroup enforcement | Athena workgroup | `EnforceWorkGroupConfiguration: true` (per-query overrides denied) |
 | Athena result encryption | Athena workgroup | `EncryptionOption: SSE_S3` |
 | Athena CloudWatch metrics | Athena workgroup | `PublishCloudWatchMetricsEnabled: true` |
@@ -97,7 +97,7 @@ Two solution-managed buckets and one customer-owned bucket are involved.
 - `BucketOwnerEnforced` ownership (S3 ACLs disabled).
 - Versioning enabled.
 - Server access logging is intentionally not configured (opt-in for the customer; CloudTrail covers Athena API events at the account level). The `cfn_nag` W35 / Checkov CKV_AWS_18 finding is suppressed inline with this rationale.
-- Lifecycle: the `query-results/` prefix (transient Athena query scratch) expires after 30 days; the `normalized/` prefix (the dashboard's persistent, date-partitioned source data) is retained, with noncurrent versions capped at 30 days. Scoping the expiry to `query-results/` is deliberate - an unscoped rule would silently delete normalized partitions.
+- Lifecycle: the `query-results/` prefix (Athena query scratch) expires after **7 days**; the `normalized/` prefix (the dashboard's persistent, date-partitioned source data) is retained, with noncurrent versions capped at 30 days. Scoping the expiry to `query-results/` is deliberate - an unscoped rule would silently delete normalized partitions. The 7-day window is short on purpose: with identity mapping on, these results contain resolved names and emails (see "Containment and isolation").
 
 **Identity-map bucket** (created by this stack only when `IDENTITY_MAPPING=true`):
 - Holds resolved names/emails (PII), so it is **isolated from the Athena results bucket** and hardened further: SSE-KMS with a dedicated customer-managed key, server access logging enabled (to a dedicated log bucket), versioning, a TLS-only `DenyInsecureTransport` policy, BPA on all four settings, and a noncurrent-version lifecycle.
@@ -180,7 +180,19 @@ This section consolidates the security posture of the optional user-identity-map
 - Mutually exclusive with `HASH_EMAILS` - the deploy script refuses to run with both, since resolving names while hashing email is contradictory and would silently defeat the privacy control.
 
 **Containment and isolation:**
-- Resolved PII lands in a **dedicated SSE-KMS bucket**, isolated from the Athena results bucket (which stays SSE-S3 for transient query scratch). The PII bucket has BPA, TLS-only, versioning, server access logging, and a noncurrent-version lifecycle.
+- The identity map itself is written to a **dedicated SSE-KMS bucket** with BPA, TLS-only, versioning, server access logging, and a noncurrent-version lifecycle. That bucket holds only the map (one row per active directory user).
+- **Resolved names and emails are not confined to that bucket.** Once the views join the map, PII flows wherever query output goes. Be explicit about this when classifying the deployment:
+
+  | Location | Encryption | Notes |
+  |---|---|---|
+  | `identity-map/` in the PII bucket | SSE-KMS (dedicated CMK) | The map. Access-logged, versioned. |
+  | `query-results/` in the Athena results bucket | SSE-S3 | **Every Athena query result** that selects a resolved column - which includes each daily SPICE refresh of the user-facing datasets. Expires after 7 days; not access-logged. |
+  | QuickSight SPICE | Service-managed | The dashboard's own copy: user labels plus `idc_username` / `idc_email`. |
+  | CSV exports from a visual | None (client-side file) | Anything an author or reader downloads. |
+
+  So the CMK is **not** an access-control boundary for resolved PII: a principal with `s3:GetObject` on the results bucket can read names and emails without touching the KMS key, and KMS CloudTrail events therefore do not constitute a complete PII-access audit trail. Scope `s3:GetObject` on the results bucket, and QuickSight dashboard/dataset permissions, accordingly.
+
+  What bounds the exposure: `query-results/` expires after **7 days**, `scripts/teardown.sh` deletes the results bucket outright, and an `IDENTITY_MAPPING=false` re-deploy rebuilds the views without the join so no *new* resolved output is produced. If your policy requires resolved PII to sit only behind a customer-managed key, encrypt the Athena results bucket with your own CMK and set the workgroup's `EncryptionOption` to `SSE_KMS` - this solution does not do that by default, to keep the deployed service set small.
 - The map is written by a single atomic `PutObject`, so QuickSight/Athena never read a half-written file. The Lambda **fails closed**: any error leaves the previous good map in place rather than regressing the dashboard to GUIDs or partial data.
 
 **Opt-out and teardown:**

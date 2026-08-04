@@ -38,10 +38,16 @@ echo "=== Preflight check ==="
 # 1) Required env vars
 echo
 echo "[1/6] Required environment"
-[[ -n "${KIRO_LOGS_BUCKET}" ]] && ok "KIRO_LOGS_BUCKET=${KIRO_LOGS_BUCKET}" \
-    || fail "KIRO_LOGS_BUCKET unset - point at the bucket Kiro exports to"
-[[ -n "${QS_PRINCIPAL_ARN}" ]] && ok "QS_PRINCIPAL_ARN=${QS_PRINCIPAL_ARN}" \
-    || fail "QS_PRINCIPAL_ARN unset - find via 'aws quicksight list-users --aws-account-id <id> --namespace default --region ${REGION}'"
+if [[ -n "${KIRO_LOGS_BUCKET}" ]]; then
+    ok "KIRO_LOGS_BUCKET=${KIRO_LOGS_BUCKET}"
+else
+    fail "KIRO_LOGS_BUCKET unset - point at the bucket Kiro exports to"
+fi
+if [[ -n "${QS_PRINCIPAL_ARN}" ]]; then
+    ok "QS_PRINCIPAL_ARN=${QS_PRINCIPAL_ARN}"
+else
+    fail "QS_PRINCIPAL_ARN unset - find via 'aws quicksight list-users --aws-account-id <id> --namespace default --region ${REGION}'"
+fi
 
 # 2) AWS identity
 echo

@@ -10,16 +10,22 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Least privilege: these jobs only read the checkout.
 permissions:
   contents: read
+
+# Actions are pinned to a commit SHA, not a tag. A tag is mutable, so `@v4`
+# silently follows whatever the maintainer moves it to - a supply-chain risk
+# that matters more than usual for a public sample other people fork. The
+# trailing comment records the human-readable version each SHA corresponds to.
 
 jobs:
   checks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           # The scripts declare Python 3.10+ as the floor (they use `X | None`
           # syntax), so test the floor rather than only the latest.
@@ -42,7 +48,7 @@ jobs:
   bash32:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Confirm the runner really has bash 3.x
         run: /bin/bash --version | head -1
@@ -54,18 +60,19 @@ jobs:
             /bin/bash -n "$f" && echo ok
           done
 
-  # Python floor and ceiling: 3.10 is the documented minimum, and the Lambdas run
-  # on 3.14. A syntax feature that works on one and not the other would otherwise
-  # only surface at deploy time.
+  # Python floor AND ceiling: 3.10 is the documented minimum for the local
+  # scripts, and 3.14 is the runtime the Lambdas actually run on. Testing only
+  # the middle would leave the real ceiling unexercised, so a syntax or stdlib
+  # difference would first surface in a customer's Lambda.
   python-matrix:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.13"]
+        python-version: ["3.10", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: ${{ matrix.python-version }}
       - name: Unit tests

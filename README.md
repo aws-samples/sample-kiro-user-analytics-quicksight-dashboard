@@ -335,6 +335,26 @@ aws logs tail "/aws/lambda/<stack-prefix>-data-normalize-report" --since 2d --re
 
 A `FAILED to normalize <key>` line names the offending object and the exception type. That file is skipped and retried on every subsequent run, so it will keep failing — and keep alarming — until the source export is corrected or removed.
 
+## Development
+
+Before opening a pull request:
+
+```bash
+scripts/run-checks.sh
+```
+
+That runs everything CI runs, offline — no AWS account, no credentials, no network — in a couple of seconds:
+
+* **Unit tests** (`python3 -m unittest discover -s tests`) covering the invariants whose violation is *silent* on the dashboard: header-keyed CSV parsing as Kiro's export drifts, tier-label rendering, view dependency ordering, the dataset inventories that drive the identity-mapping opt-out, IAM policy rendering, and the dashboard definition's internal consistency.
+* **Shell syntax under bash 3.2 as well as bash 5** — macOS still ships 3.2, and the scripts deliberately avoid bash-4 syntax.
+* **A portability gate** rejecting bash-4-only constructs (`mapfile`, `declare -A`, `${var,,}`) and GNU-only tool usage (`sed -i`, `date -d`, `grep -P`).
+* **`shellcheck`** and **`cfn-lint`** when installed; skipped with a notice when not, so a missing linter never blocks you locally. CI installs both.
+* **Hygiene**: no real account IDs, inclusive language.
+
+See [`tests/README.md`](./tests/README.md) for what each test file guards against, including the mutation results showing that each historical bug is caught if reintroduced.
+
+Everything requiring an AWS account is out of scope by design — a contributor should be able to validate a change without deploying.
+
 ## Troubleshooting
 
 * **`scripts/preflight.sh` or `scripts/deploy.sh` hangs at the Kiro export layout / prefix detection step**: the script is running `aws s3 ls --recursive` to auto-detect `KIRO_LOGS_PREFIX`. On large buckets that hold other content (Amazon Q logs, other AWS service logs, prompt logs from another product) this can take many minutes and incurs an S3 LIST charge per 1000 keys scanned. Interrupt with Ctrl-C, find the prefix non-recursively (`aws s3 ls "s3://${KIRO_LOGS_BUCKET}/" --region "${AWS_REGION}"`), set `KIRO_LOGS_PREFIX` explicitly (e.g. `export KIRO_LOGS_PREFIX="usage-activity/"`), and re-run.

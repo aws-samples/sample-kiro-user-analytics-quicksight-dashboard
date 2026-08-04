@@ -1,0 +1,72 @@
+name: checks
+
+# Offline checks only: unit tests plus shell, CloudFormation and Python linting.
+# No AWS credentials are used or needed, so this runs safely on pull requests
+# from forks - which is the point, since this is a public sample and most
+# contributions will arrive that way.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # The scripts declare Python 3.10+ as the floor (they use `X | None`
+          # syntax), so test the floor rather than only the latest.
+          python-version: "3.10"
+
+      - name: Install linters
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install cfn-lint
+          # shellcheck is preinstalled on ubuntu-latest runners.
+          shellcheck --version
+
+      - name: Run all checks
+        working-directory: .
+        run: scripts/run-checks.sh
+
+  # The scripts must also parse under macOS's bash 3.2, which is the version a
+  # large share of customers actually run them on. ubuntu-latest ships bash 5,
+  # so that gap is only covered here.
+  bash32:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Confirm the runner really has bash 3.x
+        run: /bin/bash --version | head -1
+
+      - name: Parse every script under bash 3.2
+        run: |
+          for f in scripts/*.sh; do
+            printf 'parsing %s ... ' "$f"
+            /bin/bash -n "$f" && echo ok
+          done
+
+  # Python floor and ceiling: 3.10 is the documented minimum, and the Lambdas run
+  # on 3.14. A syntax feature that works on one and not the other would otherwise
+  # only surface at deploy time.
+  python-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Unit tests
+        run: PYTHONPATH=tests python3 -m unittest discover -s tests -v

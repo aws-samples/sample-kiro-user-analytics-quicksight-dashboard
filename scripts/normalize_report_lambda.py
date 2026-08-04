@@ -270,7 +270,16 @@ def _parse_file(body: str, source_key: str, part_id: str,
     for row in reader:
         def get(canon: str) -> str:
             hdr = key_to_header.get(canon)
-            return row.get(hdr, "") if hdr is not None else ""
+            if hdr is None:
+                return ""
+            # `or ""` matters, not just the .get default: on a TRUNCATED row
+            # csv.DictReader fills the missing trailing fields with restval,
+            # which is None - so row[hdr] EXISTS with value None and the default
+            # never fires. csv.writer then renders that as the literal string
+            # "None", which Athena's TRY(CAST(... AS bigint)) turns into 0 via
+            # COALESCE. The result is a silent under-count rather than an error.
+            # Normalise to empty so a missing value reads as missing everywhere.
+            return row.get(hdr) or ""
 
         date_v = get("date")
         user_v = get("userid")

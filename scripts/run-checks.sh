@@ -117,9 +117,20 @@ fi
 # 7) Repo hygiene --------------------------------------------------------------
 # Things that should never reach a public sample.
 section "Hygiene"
-if grep -rInE '[^0-9](7[0-9]{11})[^0-9]' --include='*.py' --include='*.sh' \
+# Matches ANY 12-digit number, on a word boundary. Two flaws in the previous
+# pattern ('[^0-9](7[0-9]{11})[^0-9]'), both of which made it pass on real IDs:
+#   1. `7[0-9]{11}` only matched IDs starting with 7 - an accident of the account
+#      this sample was developed in. Any other leading digit sailed through.
+#   2. Requiring a non-digit on BOTH sides meant an ID at end-of-line never
+#      matched at all, because there is no trailing character to consume. That is
+#      the common case: "Account: 123456789012" with nothing after it.
+# \b fixes both. The allowlist carries the AWS documentation placeholders.
+ACCT_OK='123456789012|111122223333|222233334444|333344445555|444455556666'
+ACCT_HITS="$(grep -rInE '\b[0-9]{12}\b' --include='*.py' --include='*.sh' \
         --include='*.yaml' --include='*.sql' --include='*.md' . 2>/dev/null \
-        | grep -v '123456789012' | grep -v tests/ >/dev/null; then
+        | grep -vE "${ACCT_OK}" | grep -v tests/ | grep -v run-checks.sh)"
+if [[ -n "${ACCT_HITS}" ]]; then
+    printf '%s\n' "${ACCT_HITS}"
     fail "a real-looking 12-digit account ID is present (use 123456789012)"
 else
     pass "no real account IDs"

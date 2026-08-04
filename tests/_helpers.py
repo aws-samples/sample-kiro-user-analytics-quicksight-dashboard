@@ -61,11 +61,26 @@ def _stub_aws() -> None:
             self.response = error_response or {}
             self.operation_name = operation_name
 
+    class BotoCoreError(Exception):
+        """Sibling of ClientError, NOT its parent - matching real botocore, where
+        issubclass(ClientError, BotoCoreError) is False. Scripts catch them as a
+        tuple (`except (BotoCoreError, ClientError)`), so collapsing them into one
+        class would let a test pass on a hierarchy that does not exist.
+
+        Present because a script that imports a name this stub omits fails with
+        `cannot import name X from 'botocore.exceptions'` - an error that points
+        at botocore rather than at this file, which is a confusing place to start
+        debugging. Add the name here when a script starts importing it.
+        """
+
+        fmt = "An unspecified error occurred"
+
     botocore_mod = types.ModuleType("botocore")
     config_mod = types.ModuleType("botocore.config")
     config_mod.Config = Config
     exceptions_mod = types.ModuleType("botocore.exceptions")
     exceptions_mod.ClientError = ClientError
+    exceptions_mod.BotoCoreError = BotoCoreError
     botocore_mod.config = config_mod
     botocore_mod.exceptions = exceptions_mod
 

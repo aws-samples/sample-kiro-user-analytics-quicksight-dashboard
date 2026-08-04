@@ -115,6 +115,61 @@ DATA_STACK="${STACK_PREFIX}-data"
 QS_STACK="${STACK_PREFIX}-qs"
 IDMAP_STACK="${STACK_PREFIX}-identity-map"
 
+# --- Version stamping ---------------------------------------------------------
+# Every stack gets a KiroAnalyticsVersion tag and every QuickSight dashboard
+# version gets the same string in its VersionDescription. Without this there is
+# no way to answer "which version is this customer running?" - the symptom we hit
+# repeatedly while supporting deployments, where a fixed bug appeared unfixed
+# because the deployment predated the fix and nothing on it recorded that.
+# `< file` redirection failing is a SHELL error, not tr's, so `2>/dev/null` on
+# tr does not suppress it - a missing VERSION would print a raw
+# "No such file or directory" before the clean warning below. Test the file
+# first instead. Trailing whitespace and CRLF (Windows checkout) are stripped.
+if [[ -r "${ROOT}/VERSION" ]]; then
+    VERSION="$(tr -d '[:space:]' < "${ROOT}/VERSION")"
+else
+    VERSION=""
+fi
+if [[ -z "${VERSION}" ]]; then
+    # Not fatal: a missing VERSION file must not block a deploy. But say so,
+    # because the resulting deployment is the unidentifiable kind this is meant
+    # to prevent.
+    echo ">> WARNING: ${ROOT}/VERSION is missing or empty; stacks will not be" >&2
+    echo "   version-tagged and the deployment will be hard to identify later." >&2
+    VERSION="unknown"
+fi
+echo ">> Version ${VERSION}"
+
+# Merge our version tag into a stack's EXISTING tags.
+#
+# `aws cloudformation deploy --tags` REPLACES the stack's entire tag set rather
+# than merging into it (verified against a live stack: deploying with only our
+# tag wiped pre-existing CostCenter/Team tags). Passing just our own tag would
+# therefore silently destroy customers' cost-allocation and ownership tags on
+# their next upgrade - the kind of damage that surfaces weeks later in a billing
+# report. So read the current tags first and re-send them alongside ours.
+#
+# Parsing is line-and-tab based, which is safe here because CloudFormation
+# REJECTS tags whose key or value contains a tab or newline ("contained invalid
+# characters" - also verified live), and rejects empty values. Spaces ARE legal
+# and are preserved. A '=' is legal in a VALUE, so we split on the FIRST '='
+# only.
+stack_tag_args() {
+    local stack="$1"
+    STACK_TAGS=("KiroAnalyticsVersion=${VERSION}")
+    local existing
+    existing="$(aws cloudformation describe-stacks --region "${REGION}" \
+        --stack-name "${stack}" \
+        --query "Stacks[0].Tags[?Key!='KiroAnalyticsVersion'].[Key,Value]" \
+        --output text 2>/dev/null || echo "")"
+    [[ -z "${existing}" || "${existing}" == "None" ]] && return 0
+    local key value
+    while IFS="$(printf '\t')" read -r key value; do
+        [[ -z "${key}" ]] && continue
+        STACK_TAGS+=("${key}=${value}")
+    done <<< "${existing}"
+}
+
 # --- Identity mapping: opt-in gate, prompts, and validation -----------------
 # Resolve the opt-in. On an interactive deploy with nothing preset, ask once.
 if [[ "${IDENTITY_MAPPING}" != "true" && -t 0 && -z "${IDENTITY_STORE_ID}" ]]; then
@@ -246,11 +301,13 @@ if aws s3 ls "s3://${RESULTS_BUCKET}/" --region "${REGION}" >/dev/null 2>&1; the
 fi
 
 echo ">> Deploying ${DATA_STACK}"
+stack_tag_args "${DATA_STACK}"
 aws cloudformation deploy \
     --region "${REGION}" \
     --stack-name "${DATA_STACK}" \
     --template-file "${ROOT}/cfn/01-data-layer.yaml" \
     --capabilities CAPABILITY_IAM \
+    --tags "${STACK_TAGS[@]}" \
     --parameter-overrides \
         "KiroLogsBucketName=${KIRO_LOGS_BUCKET}" \
         "KiroLogsPrefix=${KIRO_LOGS_PREFIX}" \
@@ -264,11 +321,13 @@ if [[ -z "${NRM_CODE_KEY}" ]]; then
     echo ">> Staging normalizer zip (first deploy) and re-deploying ${DATA_STACK}"
     aws s3 cp "${NRM_BUILD_DIR}/normalize_report_lambda.zip" \
         "s3://${RESULTS_BUCKET}/${NRM_KEY}" --region "${REGION}"
+    stack_tag_args "${DATA_STACK}"
     aws cloudformation deploy \
         --region "${REGION}" \
         --stack-name "${DATA_STACK}" \
         --template-file "${ROOT}/cfn/01-data-layer.yaml" \
         --capabilities CAPABILITY_IAM \
+        --tags "${STACK_TAGS[@]}" \
         --parameter-overrides \
             "KiroLogsBucketName=${KIRO_LOGS_BUCKET}" \
             "KiroLogsPrefix=${KIRO_LOGS_PREFIX}" \
@@ -400,11 +459,13 @@ if [[ "${IDENTITY_MAPPING}" == "true" ]]; then
         "s3://${RESULTS_BUCKET}/${LAMBDA_KEY}" --region "${REGION}"
 
     echo ">> Deploying ${IDMAP_STACK}"
+    stack_tag_args "${IDMAP_STACK}"
     aws cloudformation deploy \
         --region "${REGION}" \
         --stack-name "${IDMAP_STACK}" \
         --template-file "${ROOT}/cfn/03-identity-mapping.yaml" \
         --capabilities CAPABILITY_IAM \
+        --tags "${STACK_TAGS[@]}" \
         --parameter-overrides \
             "ResourcePrefix=${STACK_PREFIX}" \
             "IdentityStoreId=${IDENTITY_STORE_ID}" \
@@ -630,11 +691,13 @@ if [[ "${qs_status}" == "ROLLBACK_COMPLETE" ]]; then
 fi
 
 echo ">> Deploying ${QS_STACK} (DataSource + DataSets)"
+stack_tag_args "${QS_STACK}"
 aws cloudformation deploy \
     --region "${REGION}" \
     --stack-name "${QS_STACK}" \
     --template-file "${ROOT}/cfn/02-quicksight.yaml" \
     --capabilities CAPABILITY_IAM \
+    --tags "${STACK_TAGS[@]}" \
     --parameter-overrides \
         "GlueDatabase=${DATABASE}" \
         "AthenaWorkgroup=${WORKGROUP}" \
@@ -655,6 +718,7 @@ python3 "${ROOT}/scripts/create_dashboard.py" \
     --principal-arn "${QS_PRINCIPAL_ARN}" \
     --asset-id "${ASSET_ID}" \
     --resource-prefix "${STACK_PREFIX}" \
+    --version "${VERSION}" \
     ${THEME_ARN:+--theme-arn "${THEME_ARN}"} \
     ${IDMAP_BUCKET:+--identity-mapping}
 
@@ -808,4 +872,4 @@ PY
     echo ">> Identity mapping fully removed."
 fi
 
-echo ">> Done. Dashboard: https://${REGION}.quicksight.aws.amazon.com/sn/dashboards/${ASSET_ID}"
+echo ">> Done (version ${VERSION}). Dashboard: https://${REGION}.quicksight.aws.amazon.com/sn/dashboards/${ASSET_ID}"

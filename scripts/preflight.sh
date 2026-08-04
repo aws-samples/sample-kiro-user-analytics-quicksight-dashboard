@@ -35,6 +35,42 @@ fail() { printf "  [FAIL] %s\n" "$1"; FAIL=$((FAIL+1)); }
 
 echo "=== Preflight check ==="
 
+# 0) Version: what this checkout is, and what is already deployed.
+# Printed FIRST because on an upgrade it reframes everything below: a customer
+# reporting a bug that was fixed two releases ago is nearly always running an
+# older deployment, and this is the line that says so.
+ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+# Test readability first: a failing `< file` redirect is a shell error that
+# `2>/dev/null` on tr would not suppress (see the same note in deploy.sh).
+if [[ -r "${ROOT}/VERSION" ]]; then
+    LOCAL_VERSION="$(tr -d '[:space:]' < "${ROOT}/VERSION")"
+else
+    LOCAL_VERSION=""
+fi
+DEPLOYED_VERSION="$(aws cloudformation describe-stacks --region "${REGION}" \
+    --stack-name "${STACK_PREFIX}-data" \
+    --query "Stacks[0].Tags[?Key=='KiroAnalyticsVersion'].Value" \
+    --output text 2>/dev/null || echo "")"
+echo
+echo "[0/6] Version"
+if [[ -n "${LOCAL_VERSION}" ]]; then
+    ok "this checkout: ${LOCAL_VERSION}"
+else
+    warn "no VERSION file found in ${ROOT} - is this a complete checkout?"
+fi
+if [[ -z "${DEPLOYED_VERSION}" || "${DEPLOYED_VERSION}" == "None" ]]; then
+    if aws cloudformation describe-stacks --region "${REGION}" \
+            --stack-name "${STACK_PREFIX}-data" >/dev/null 2>&1; then
+        warn "deployed stack '${STACK_PREFIX}-data' has no version tag (deployed before versioning; see CHANGELOG.md)"
+    else
+        ok "no existing deployment for STACK_PREFIX='${STACK_PREFIX}' (fresh install)"
+    fi
+elif [[ "${DEPLOYED_VERSION}" == "${LOCAL_VERSION}" ]]; then
+    ok "deployed: ${DEPLOYED_VERSION} (same as this checkout)"
+else
+    warn "deployed: ${DEPLOYED_VERSION}, this checkout: ${LOCAL_VERSION} - re-running deploy.sh will upgrade it (see CHANGELOG.md)"
+fi
+
 # 1) Required env vars
 echo
 echo "[1/6] Required environment"

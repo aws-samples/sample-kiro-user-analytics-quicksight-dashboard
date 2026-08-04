@@ -30,6 +30,7 @@ them (with a notice) when they are not.
 | `test_dataset_inventory.py` | `deploy.sh`'s dataset lists match the CloudFormation template | A hardcoded list drifting from the template, which left resolved PII in a SPICE dataset that the opt-out never purged |
 | `test_iam_policy.py` | Bucket-name validation, additive-policy semantics | An unvalidated bucket name rendering `arn:aws:s3:::*/*` onto the shared QuickSight role; a narrowing re-apply silently not narrowing |
 | `test_dashboard_definition.py` | Dataset references resolve, drill-through target, tier filter/display agreement | Filtering `subscription_tier` while grouping `user_tier`; a visual referencing a dataset that no longer exists |
+| `test_versioning.py` | `VERSION`/`CHANGELOG` agreement, every stack tagged, and the tag **merge** | `aws cloudformation deploy --tags` replaces rather than merges, so stamping a version tag would silently delete a customer's own cost-allocation tags — visible only weeks later in a billing report |
 
 ## Conventions
 
@@ -39,8 +40,8 @@ contributor can run these before opening a PR without an account.
 
 ## Are these tests actually load-bearing?
 
-Verified by mutation: each of the five defects this repo has shipped was
-reintroduced into a clean copy of the tree, and the suite was run.
+Verified by mutation: each defect this repo has shipped was reintroduced into a
+clean copy of the tree, and the suite was run.
 
 | Reintroduced defect | Result |
 |---|---|
@@ -49,7 +50,19 @@ reintroduced into a clean copy of the tree, and the suite was run.
 | A dataset dropped from `QS_LABEL_DATASETS` (PII left in SPICE after opt-out) | 1 failure |
 | Tier filter pointed at `subscription_tier` while visuals group `user_tier` | 2 failures |
 | A dimension inserted before `user_label`, retargeting the drill-through | 2 failures |
+| Version tag sent without merging the stack's existing tags | 8 failures |
+| `--tags` dropped from one of the four stack deploys | 1 failure (naming the stack) |
+| The `Key!=` filter removed, duplicating the version tag on upgrade | 2 failures |
+| `VersionDescription` set on the Analysis path too (which the API rejects) | 1 failure |
+| `VERSION` bumped without a `CHANGELOG.md` entry | 1 failure |
 
 The suite returns to green when each mutation is reverted. A test that cannot
 fail is not protecting anything, so this check is worth repeating if the suite is
 substantially rewritten.
+
+One mutation initially **survived**, which is worth recording because it shows
+what this exercise is for: replacing the tab-delimited `IFS` in the tag merge
+with a plain `read -r key value` left the suite green. The tests covered spaces in
+tag *values* but not in tag *keys*, and `Cost Center` is a perfectly legal — and
+common — CloudFormation tag key that whitespace splitting would corrupt into a
+different tag. `test_keys_containing_spaces_survive` closes that gap.

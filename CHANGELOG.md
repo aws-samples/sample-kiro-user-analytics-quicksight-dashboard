@@ -50,6 +50,14 @@ release and is recorded so an existing deployment can be placed in history.
 
 ### Added
 
+- A **Cost** section in the README, measured on live deployments rather than
+  estimated. The headline: the data pipeline runs at about **$0.05/month** and is
+  irrelevant to the budget, while QuickSight reader licences range from $99 to
+  **$24,024/month** for the same dashboard — so entitling every Kiro seat instead
+  of the people who act on the data is a 243× bill increase that no deploy warns
+  about. Also documents the flat **$250/month** account fee triggered by any Pro
+  user or Amazon Q in QuickSight (~6,000× the pipeline), with the CLI command to
+  check whether it already applies.
 - Offline test suite (83 tests) and GitHub Actions CI covering the bug classes
   that fail *silently* on the dashboard: dataset-inventory drift, tier-label
   handling, per-user-constant columns, view creation order, IAM policy shape and

@@ -14,6 +14,8 @@ This dashboard answers questions about how Kiro is *used*:
 
 For Kiro **cost and seat utilization** questions (per-user spend, idle seats, billing roll-ups), use the Kiro module in the [Cloud Intelligence Dashboards (CUDOS)](https://github.com/aws-solutions-library-samples/cloud-intelligence-dashboards-framework). Deploy both side-by-side for the full picture.
 
+What it costs to *run this dashboard* is a separate question, answered in [Cost](#cost): the pipeline is about $0.05/month, and Amazon QuickSight reader licences are the entire budget decision.
+
 > **Note:** This solution targets the **modern Kiro User Activity Report** export. The legacy `by_user_analytic` report (from Amazon Q Developer) is not supported - Amazon Q Developer reaches end-of-support per the [AWS announcement](https://aws.amazon.com/blogs/devops/amazon-q-developer-end-of-support-announcement/), and this dashboard is built only on the supported `user_report` schema.
 
 ## Architecture diagram
@@ -272,6 +274,79 @@ The solution is layered:
 
 5. **Identity mapping** (`cfn/03-identity-mapping.yaml`, optional): Created only when `IDENTITY_MAPPING=true`. A Lambda resolves user GUIDs to names via AWS IAM Identity Center and lands a lookup CSV in a dedicated encrypted bucket that the curated views join. See [Resolving user identities](#resolving-user-identities-optional).
 
+## Cost
+
+**The data pipeline is not what this costs. Amazon QuickSight user licences are, by three to four orders of magnitude.** Budget by counting the people you will entitle as readers, not by estimating data volume.
+
+All figures are `us-east-1` list price, measured on real deployments of this sample. Verify against the [QuickSight](https://aws.amazon.com/quicksight/pricing/), [Athena](https://aws.amazon.com/athena/pricing/), [Lambda](https://aws.amazon.com/lambda/pricing/) and [S3](https://aws.amazon.com/s3/pricing/) pricing pages for your Region and negotiated rates.
+
+### The pipeline: about $0.05/month
+
+Measured over 30 days of daily scheduled operation:
+
+| Component | Driver | Cost/month |
+|---|---|---|
+| Amazon Athena | 664 queries, 22 MiB actually scanned | $0.03 |
+| Amazon S3 | ~590 PUT, ~13k GET, <1 MiB stored | $0.01 |
+| AWS Lambda | 31 invocations, 256 MB, 2.7 s average | $0.0003 |
+| Amazon CloudWatch Logs | <1 MiB ingested (30-day retention) | $0.0005 |
+| SPICE capacity | within the 10 GB included with one author | $0.00 |
+| **Total** | | **≈ $0.05** |
+
+Two things are worth understanding, because they mean this figure barely moves as you grow:
+
+* **Athena cost is driven by query count, not data size.** Athena bills $5/TB with a **10 MB minimum per query**, and every query here is far below that floor — so you are paying the minimum once per query, and the bill would be almost identical with 100× the data. A deployment carrying realistic volume (385 users, 2 months) measured 10.6 GiB scanned across 726 queries: still **$0.05/month**. Steady state is about **10 queries per night** (the 8 dataset refreshes plus the normalizer's own work); the 664 above includes deploy-time and ad-hoc queries. Scanned bytes are not the lever here — query count is.
+* **SPICE stays inside the included allowance.** Measured at **1.9 KiB per user-day**, which scales to roughly **5.2 GiB for 8,000 seats over a year** — under the 10 GB included with a single author, so extra capacity costs nothing. Two years of 8,000 seats lands at ~10.5 GiB, which is $0.19/month for the overage. `model_usage` is 63% of that footprint, being the only long-form (one row per user/day/model) dataset.
+
+Enabling [identity mapping](#resolving-user-identities-optional) adds a dedicated AWS KMS customer-managed key at **$1/month** (prorated hourly) plus a second Lambda and bucket. The key alone costs roughly 25× the rest of the pipeline, and it is **retained after teardown** by design — see [Cleaning up](#cleaning-up).
+
+### QuickSight licences: $24 to $24,000/month
+
+This is the entire cost decision:
+
+| Entitlement | Cost/month |
+|---|---|
+| 1 author, no readers | $24 |
+| 1 author + 25 readers | $99 |
+| 1 author + 100 readers | $324 |
+| 1 author + 1,000 readers | $3,024 |
+| 1 author + 8,000 readers (all seats) | **$24,024** |
+
+> **The trap.** Entitling every Kiro seat as a dashboard reader rather than the ~25 people who actually need it is a **243× bill increase** — from $99 to $24,024/month. Nothing in a deploy warns you, because entitlement happens in the QuickSight console afterwards, not in this stack. This dashboard reports on *managers'* questions about a fleet; the fleet does not need to read it.
+
+Readers are billed per provisioned user per month whether or not they log in, so an entitlement granted once and forgotten keeps billing. Audit periodically:
+
+```bash
+aws quicksight list-users --aws-account-id "$ACCOUNT_ID" --namespace default \
+    --region "$AWS_REGION" --query 'UserList[].[UserName,Role]' --output table
+```
+
+### The $250/month fee that dwarfs everything else here
+
+An account with **at least one Pro user** (`AUTHOR_PRO` / `READER_PRO` / `ADMIN_PRO`), or with **Amazon Q in QuickSight enabled**, incurs a **flat $250/month per-account infrastructure fee** — about **6,000× this pipeline's entire cost**, and it applies to the account regardless of this sample.
+
+Check before you attribute it to this dashboard:
+
+```bash
+# Any Pro user in the account triggers the fee:
+aws quicksight list-users --aws-account-id "$ACCOUNT_ID" --namespace default \
+    --region "$AWS_REGION" --query "UserList[?ends_with(Role,'PRO')].[UserName,Role]" --output table
+```
+
+If that returns rows, the $250 is already on your bill and this sample did not put it there. A plain `AUTHOR` and `READER` deployment does not incur it.
+
+### Reducing cost
+
+In descending order of impact — the first item is worth more than every other line combined:
+
+1. **Entitle fewer readers.** Share the dashboard with the people who act on it. Use a QuickSight group rather than per-user grants so removal is one operation. Everything below is rounding error next to this.
+2. **Avoid Pro users and Q** in the account if you do not need them (saves $250/month).
+3. **Reduce refresh frequency** if daily is more than you need. Each dataset has its own schedule in `cfn/02-quicksight.yaml`; the 8 datasets plus the normalizer are the whole query load.
+4. **Set `LOG_RETENTION_DAYS`** lower than the 30-day default if log volume grows.
+5. **Tear down when evaluating.** `scripts/teardown.sh` removes everything billable that this stack created; unsubscribing QuickSight is a separate console action, and licence charges continue until you do it.
+
+Costs are tagged `KiroAnalyticsVersion` on every stack (see [Upgrading](#upgrading)), so you can also split this out in AWS Cost Explorer once you activate that as a cost-allocation tag.
+
 ## Customization options
 
 * **Hash emails before they reach SPICE**: Set `HASH_EMAILS=true`. The base view replaces `email` with `to_hex(sha256(email))`. The user labels in tables and the User detail drill-down show opaque digests instead of plaintext.
@@ -382,7 +457,7 @@ scripts/run-checks.sh
 
 That runs everything CI runs, offline — no AWS account, no credentials, no network — in a couple of seconds:
 
-* **Unit tests** (`python3 -m unittest discover -s tests`) covering the invariants whose violation is *silent* on the dashboard: header-keyed CSV parsing as Kiro's export drifts, tier-label rendering, view dependency ordering, the dataset inventories that drive the identity-mapping opt-out, IAM policy rendering, version stamping (including that adding the version tag does not wipe a customer's own stack tags), and the dashboard definition's internal consistency.
+* **Unit tests** (`python3 -m unittest discover -s tests`) covering the invariants whose violation is *silent* on the dashboard: header-keyed CSV parsing as Kiro's export drifts, tier-label rendering, view dependency ordering, the dataset inventories that drive the identity-mapping opt-out, IAM policy rendering, version stamping (including that adding the version tag does not wipe a customer's own stack tags), the cost table's internal arithmetic, and the dashboard definition's internal consistency.
 * **Shell syntax under bash 3.2 as well as bash 5** — macOS still ships 3.2, and the scripts deliberately avoid bash-4 syntax.
 * **A portability gate** rejecting bash-4-only constructs (`mapfile`, `declare -A`, `${var,,}`) and GNU-only tool usage (`sed -i`, `date -d`, `grep -P`).
 * **`shellcheck`** and **`cfn-lint`** when installed; skipped with a notice when not, so a missing linter never blocks you locally. CI installs both.
@@ -421,7 +496,7 @@ scripts/teardown.sh
 
 The teardown script deletes the QuickSight Dashboard, Analysis, both AWS CloudFormation stacks, and the Amazon Athena results bucket. The Kiro logs bucket and its contents are not modified. The script is idempotent and is safe to re-run.
 
-If identity mapping was enabled, teardown also removes the `<prefix>-identity-map` stack and **empties and deletes its dedicated PII bucket** (and the bucket's access-log bucket), purging all object versions so no resolved names survive. The bucket's **AWS KMS key is retained** (it has `DeletionPolicy: Retain`, the safe default for a CMK) - it is not billed beyond the key itself. To remove it, schedule its deletion manually:
+If identity mapping was enabled, teardown also removes the `<prefix>-identity-map` stack and **empties and deletes its dedicated PII bucket** (and the bucket's access-log bucket), purging all object versions so no resolved names survive. The bucket's **AWS KMS key is retained** (it has `DeletionPolicy: Retain`, the safe default for a CMK). A retained customer-managed key continues to bill at **$1/month** (prorated hourly) even with nothing left to decrypt - more than this entire pipeline costs to run - so remove it if you are done. Schedule its deletion manually:
 
 ```bash
 aws kms schedule-key-deletion \

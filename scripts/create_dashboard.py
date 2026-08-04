@@ -32,11 +32,9 @@ DATASET_SUFFIXES = {
     "trends":       "daily-trends",
     "users":        "user-totals",
     "tiers":        "tier-breakdown",
-    "engagement":   "engagement",
     "movers":       "wow-movers",
     "models":       "model-usage",
     "heatmap":      "activity-heatmap",
-    "period":       "period-comparison",
 }
 # NOTE: the People engagement funnel was reworked from the native funnel chart
 # (which read the `engagement-funnel` SPICE dataset) to three date-range-driven
@@ -172,36 +170,6 @@ def _kpi_calc(visual_id: str, title: str, dataset: str, calc_field: str):
     }
 
 
-def _kpi_percent(visual_id: str, title: str, dataset: str, column: str, agg: str = "AVERAGE"):
-    """KPI that renders a 0-1 measure as a percentage. Used for seat
-    utilization: AVERAGE(is_active) over the provisioned-user roster =
-    fraction of users active in the trailing-30d window."""
-    return {
-        "KPIVisual": {
-            "VisualId": visual_id,
-            "Title": {"Visibility": "VISIBLE", "FormatText": {"PlainText": title}},
-            "ChartConfiguration": {
-                "FieldWells": {
-                    "Values": [{
-                        "NumericalMeasureField": {
-                            "FieldId": f"{visual_id}-v",
-                            "Column": {"DataSetIdentifier": dataset, "ColumnName": column},
-                            "AggregationFunction": {"SimpleNumericalAggregation": agg},
-                            "FormatConfiguration": {
-                                "FormatConfiguration": {
-                                    "PercentageDisplayFormatConfiguration": {
-                                        "DecimalPlacesConfiguration": {"DecimalPlaces": 0},
-                                    },
-                                },
-                            },
-                        },
-                    }],
-                },
-            },
-        },
-    }
-
-
 def _kpi_distinct_count(visual_id: str, title: str, dataset: str, column: str):
     return {
         "KPIVisual": {
@@ -217,80 +185,6 @@ def _kpi_distinct_count(visual_id: str, title: str, dataset: str, column: str):
                         },
                     }],
                 },
-            },
-        },
-    }
-
-
-def _line(visual_id: str, title: str, dataset: str, date_col: str, value_col: str,
-          color_col: str | None = None, agg: str = "SUM"):
-    field_wells = {
-        "Category": [{
-            "DateDimensionField": {
-                "FieldId": f"{visual_id}-d",
-                "Column": {"DataSetIdentifier": dataset, "ColumnName": date_col},
-                "DateGranularity": "DAY",
-            },
-        }],
-        "Values": [{
-            "NumericalMeasureField": {
-                "FieldId": f"{visual_id}-v",
-                "Column": {"DataSetIdentifier": dataset, "ColumnName": value_col},
-                "AggregationFunction": {"SimpleNumericalAggregation": agg},
-            },
-        }],
-    }
-    chart_config = {"FieldWells": {"LineChartAggregatedFieldWells": field_wells}}
-    if color_col:
-        field_wells["Colors"] = [{
-            "CategoricalDimensionField": {
-                "FieldId": f"{visual_id}-c",
-                "Column": {"DataSetIdentifier": dataset, "ColumnName": color_col},
-            },
-        }]
-        cmap = _color_map(f"{visual_id}-c", color_col)
-        if cmap:
-            chart_config["VisualPalette"] = {"ColorMap": cmap}
-    return {
-        "LineChartVisual": {
-            "VisualId": visual_id,
-            "Title": {"Visibility": "VISIBLE", "FormatText": {"PlainText": title}},
-            "ChartConfiguration": chart_config,
-        },
-    }
-
-
-def _line_multi(visual_id: str, title: str, dataset: str, date_col: str,
-                value_cols: list[tuple[str, str]], agg: str = "SUM"):
-    """Line chart with multiple value series (one line per (column, label)).
-    Used for new-vs-returning where the two series are separate columns, not a
-    pivot dimension. Each series is a NumericalMeasureField; QuickSight renders
-    one line per value field and labels it with the column's display name."""
-    values = [
-        {
-            "NumericalMeasureField": {
-                "FieldId": f"{visual_id}-v{i}",
-                "Column": {"DataSetIdentifier": dataset, "ColumnName": col},
-                "AggregationFunction": {"SimpleNumericalAggregation": agg},
-            },
-        }
-        for i, (col, _label) in enumerate(value_cols)
-    ]
-    return {
-        "LineChartVisual": {
-            "VisualId": visual_id,
-            "Title": {"Visibility": "VISIBLE", "FormatText": {"PlainText": title}},
-            "ChartConfiguration": {
-                "FieldWells": {"LineChartAggregatedFieldWells": {
-                    "Category": [{
-                        "DateDimensionField": {
-                            "FieldId": f"{visual_id}-d",
-                            "Column": {"DataSetIdentifier": dataset, "ColumnName": date_col},
-                            "DateGranularity": "DAY",
-                        },
-                    }],
-                    "Values": values,
-                }},
             },
         },
     }
@@ -395,145 +289,6 @@ def _bar_calc(visual_id: str, title: str, dataset: str, category_col: str,
     }
 
 
-def _bar_grouped(visual_id: str, title: str, dataset: str,
-                 category_col: str, value_col: str, group_col: str,
-                 orientation: str = "VERTICAL"):
-    """Clustered/grouped bar - category on one axis, group_col splits each
-    category into side-by-side bars. Color (group) ordering follows
-    alphabetical of group_col."""
-    return {
-        "BarChartVisual": {
-            "VisualId": visual_id,
-            "Title": {"Visibility": "VISIBLE", "FormatText": {"PlainText": title}},
-            "ChartConfiguration": {
-                "BarsArrangement": "CLUSTERED",
-                "Orientation": orientation,
-                "FieldWells": {
-                    "BarChartAggregatedFieldWells": {
-                        "Category": [{
-                            "CategoricalDimensionField": {
-                                "FieldId": f"{visual_id}-c",
-                                "Column": {"DataSetIdentifier": dataset, "ColumnName": category_col},
-                            },
-                        }],
-                        "Values": [{
-                            "NumericalMeasureField": {
-                                "FieldId": f"{visual_id}-v",
-                                "Column": {"DataSetIdentifier": dataset, "ColumnName": value_col},
-                                "AggregationFunction": {"SimpleNumericalAggregation": "SUM"},
-                            },
-                        }],
-                        "Colors": [{
-                            "CategoricalDimensionField": {
-                                "FieldId": f"{visual_id}-g",
-                                "Column": {"DataSetIdentifier": dataset, "ColumnName": group_col},
-                            },
-                        }],
-                    },
-                },
-                "DataLabels": {"Visibility": "VISIBLE"},
-            },
-        },
-    }
-
-
-def _period_compare_bar(visual_id: str, title: str):
-    """Specialized clustered bar for period_comparison: prior 30d vs
-    current 30d, by tier.
-
-    Two QuickSight knobs make this a non-default visual:
-
-    - SortConfiguration.ColorSort with Direction: DESC. QS rejects sorting
-      the color dimension by any other column ('Color can only be sorted
-      by itself'), so we sort the period values by themselves. P > C
-      alphabetically; DESC puts 'Prior' before 'Current' in the cluster
-      ordering, which renders left-to-right Prior → Current.
-    - VisualPalette.ColorMap pins 'Current' to kiro purple and 'Prior' to
-      warm orange explicitly. Without this, palette assignment is
-      alphabetical and the 'headline' period gets the secondary color.
-    """
-    field_g = f"{visual_id}-g"
-    return {
-        "BarChartVisual": {
-            "VisualId": visual_id,
-            "Title": {"Visibility": "VISIBLE", "FormatText": {"PlainText": title}},
-            "ChartConfiguration": {
-                "BarsArrangement": "CLUSTERED",
-                "Orientation": "VERTICAL",
-                "FieldWells": {
-                    "BarChartAggregatedFieldWells": {
-                        "Category": [{
-                            "CategoricalDimensionField": {
-                                "FieldId": f"{visual_id}-c",
-                                "Column": {"DataSetIdentifier": "period", "ColumnName": "subscription_tier"},
-                            },
-                        }],
-                        "Values": [{
-                            "NumericalMeasureField": {
-                                "FieldId": f"{visual_id}-v",
-                                "Column": {"DataSetIdentifier": "period", "ColumnName": "messages"},
-                                "AggregationFunction": {"SimpleNumericalAggregation": "SUM"},
-                            },
-                        }],
-                        "Colors": [{
-                            "CategoricalDimensionField": {
-                                "FieldId": field_g,
-                                "Column": {"DataSetIdentifier": "period", "ColumnName": "period"},
-                            },
-                        }],
-                    },
-                },
-                "SortConfiguration": {
-                    "ColorSort": [{
-                        "FieldSort": {"FieldId": field_g, "Direction": "DESC"},
-                    }],
-                },
-                "DataLabels": {"Visibility": "VISIBLE"},
-                "VisualPalette": {
-                    "ColorMap": [
-                        {"Element": {"FieldId": field_g, "FieldValue": "Current"}, "Color": "#9046FF"},
-                        {"Element": {"FieldId": field_g, "FieldValue": "Prior"},   "Color": "#FF8C00"},
-                    ],
-                },
-            },
-        },
-    }
-
-
-def _bar_stacked(visual_id: str, title: str, dataset: str,
-                 category_col: str, value_cols: list[tuple[str, str]]):
-    """Vertical stacked bar with multiple measures stacked per category.
-    `value_cols` is a list of (column_name, display_label) pairs."""
-    return {
-        "BarChartVisual": {
-            "VisualId": visual_id,
-            "Title": {"Visibility": "VISIBLE", "FormatText": {"PlainText": title}},
-            "ChartConfiguration": {
-                "BarsArrangement": "STACKED",
-                "Orientation": "VERTICAL",
-                "FieldWells": {
-                    "BarChartAggregatedFieldWells": {
-                        "Category": [{
-                            "CategoricalDimensionField": {
-                                "FieldId": f"{visual_id}-c",
-                                "Column": {"DataSetIdentifier": dataset, "ColumnName": category_col},
-                            },
-                        }],
-                        "Values": [{
-                            "NumericalMeasureField": {
-                                "FieldId": f"{visual_id}-v{i}",
-                                "Column": {"DataSetIdentifier": dataset, "ColumnName": col},
-                                "AggregationFunction": {"SimpleNumericalAggregation": "SUM"},
-                            },
-                        } for i, (col, _label) in enumerate(value_cols)],
-                    },
-                },
-                "DataLabels": {"Visibility": "VISIBLE"},
-            },
-        },
-    }
-
-
 def _pie(visual_id: str, title: str, dataset: str, category_col: str, value_col: str):
     return {
         "PieChartVisual": {
@@ -618,201 +373,13 @@ def _sub(visual: dict, subtitle: str) -> dict:
 
 # --- Executive-page helpers ---------------------------------------------------
 
-def _kpi_sparkline(visual_id: str, title: str, dataset: str, value_col: str,
-                   date_col: str, agg: str = "SUM"):
-    """KPI tile showing the windowed total with a sparkline trend
-    (TrendGroups gives the sparkline its daily series). No period-over-period
-    comparison: see the KPIOptions note below for why the comparison/date
-    label is intentionally omitted.
-    """
-    return {
-        "KPIVisual": {
-            "VisualId": visual_id,
-            "Title": {"Visibility": "VISIBLE", "FormatText": {"PlainText": title}},
-            "ChartConfiguration": {
-                "FieldWells": {
-                    "Values": [{
-                        "NumericalMeasureField": {
-                            "FieldId": f"{visual_id}-v",
-                            "Column": {"DataSetIdentifier": dataset, "ColumnName": value_col},
-                            "AggregationFunction": {"SimpleNumericalAggregation": agg},
-                            "FormatConfiguration": _AUTO_NUMBER_FORMAT,
-                        },
-                    }],
-                    "TrendGroups": [{
-                        "DateDimensionField": {
-                            "FieldId": f"{visual_id}-t",
-                            "Column": {"DataSetIdentifier": dataset, "ColumnName": date_col},
-                            "DateGranularity": "DAY",
-                        },
-                    }],
-                },
-                "KPIOptions": {
-                    # KPI shows the windowed total + a sparkline trend only.
-                    # A KPI with a date TrendGroup auto-renders a "secondary
-                    # value" - the latest trend point's DATE (e.g. "Jun 2,
-                    # 2026") next to a period-over-period difference. That read
-                    # as "data ends June 2" and as a number that didn't match
-                    # the windowed total. SecondaryValue: HIDDEN suppresses that
-                    # date/difference while keeping the sparkline. (Omitting the
-                    # Comparison/TrendArrows blocks alone does NOT remove it -
-                    # the secondary value is on by default for a TrendGroup KPI.)
-                    "Sparkline": {"Type": "LINE", "Visibility": "VISIBLE"},
-                    "SecondaryValue": {"Visibility": "HIDDEN"},
-                    "PrimaryValueDisplayType": "ACTUAL",
-                },
-            },
-        },
-    }
-
-
-def _kpi_sparkline_calc(visual_id: str, title: str, dataset: str,
-                        value_col: str, date_col: str):
-    """KPI for an already-aggregated calculated field (e.g. sum(a)/sum(b)).
-    QS rejects AggregationFunction on aggregated calc fields - we use a
-    NumericalMeasureField with the field omitted."""
-    return {
-        "KPIVisual": {
-            "VisualId": visual_id,
-            "Title": {"Visibility": "VISIBLE", "FormatText": {"PlainText": title}},
-            "ChartConfiguration": {
-                "FieldWells": {
-                    "Values": [{
-                        "NumericalMeasureField": {
-                            "FieldId": f"{visual_id}-v",
-                            "Column": {"DataSetIdentifier": dataset, "ColumnName": value_col},
-                            "FormatConfiguration": _AUTO_NUMBER_FORMAT,
-                        },
-                    }],
-                    "TrendGroups": [{
-                        "DateDimensionField": {
-                            "FieldId": f"{visual_id}-t",
-                            "Column": {"DataSetIdentifier": dataset, "ColumnName": date_col},
-                            "DateGranularity": "DAY",
-                        },
-                    }],
-                },
-                "KPIOptions": {
-                    # KPI shows the windowed total + a sparkline trend only.
-                    # A KPI with a date TrendGroup auto-renders a "secondary
-                    # value" - the latest trend point's DATE (e.g. "Jun 2,
-                    # 2026") next to a period-over-period difference. That read
-                    # as "data ends June 2" and as a number that didn't match
-                    # the windowed total. SecondaryValue: HIDDEN suppresses that
-                    # date/difference while keeping the sparkline. (Omitting the
-                    # Comparison/TrendArrows blocks alone does NOT remove it -
-                    # the secondary value is on by default for a TrendGroup KPI.)
-                    "Sparkline": {"Type": "LINE", "Visibility": "VISIBLE"},
-                    "SecondaryValue": {"Visibility": "HIDDEN"},
-                    "PrimaryValueDisplayType": "ACTUAL",
-                },
-            },
-        },
-    }
-
-
-def _kpi_sparkline_distinct(visual_id: str, title: str, dataset: str,
-                            value_col: str, date_col: str):
-    """Same shape as _kpi_sparkline but for a DISTINCT_COUNT (e.g. active users)."""
-    return {
-        "KPIVisual": {
-            "VisualId": visual_id,
-            "Title": {"Visibility": "VISIBLE", "FormatText": {"PlainText": title}},
-            "ChartConfiguration": {
-                "FieldWells": {
-                    "Values": [{
-                        "CategoricalMeasureField": {
-                            "FieldId": f"{visual_id}-v",
-                            "Column": {"DataSetIdentifier": dataset, "ColumnName": value_col},
-                            "AggregationFunction": "DISTINCT_COUNT",
-                            # CategoricalMeasureField FormatConfiguration uses a
-                            # different shape than NumericalMeasureField - it
-                            # nests under NumericFormatConfiguration directly.
-                            "FormatConfiguration": {
-                                "NumericFormatConfiguration": {
-                                    "NumberDisplayFormatConfiguration": {
-                                        "NumberScale": "AUTO",
-                                        "DecimalPlacesConfiguration": {"DecimalPlaces": 1},
-                                    },
-                                },
-                            },
-                        },
-                    }],
-                    "TrendGroups": [{
-                        "DateDimensionField": {
-                            "FieldId": f"{visual_id}-t",
-                            "Column": {"DataSetIdentifier": dataset, "ColumnName": date_col},
-                            "DateGranularity": "DAY",
-                        },
-                    }],
-                },
-                "KPIOptions": {
-                    # KPI shows the windowed total + a sparkline trend only.
-                    # A KPI with a date TrendGroup auto-renders a "secondary
-                    # value" - the latest trend point's DATE (e.g. "Jun 2,
-                    # 2026") next to a period-over-period difference. That read
-                    # as "data ends June 2" and as a number that didn't match
-                    # the windowed total. SecondaryValue: HIDDEN suppresses that
-                    # date/difference while keeping the sparkline. (Omitting the
-                    # Comparison/TrendArrows blocks alone does NOT remove it -
-                    # the secondary value is on by default for a TrendGroup KPI.)
-                    "Sparkline": {"Type": "LINE", "Visibility": "VISIBLE"},
-                    "SecondaryValue": {"Visibility": "HIDDEN"},
-                    "PrimaryValueDisplayType": "ACTUAL",
-                },
-            },
-        },
-    }
-
-
-def _area(visual_id: str, title: str, dataset: str, date_col: str, value_col: str,
-          stack_col: str | None = None):
-    field_wells = {
-        "Category": [{
-            "DateDimensionField": {
-                "FieldId": f"{visual_id}-d",
-                "Column": {"DataSetIdentifier": dataset, "ColumnName": date_col},
-                "DateGranularity": "DAY",
-            },
-        }],
-        "Values": [{
-            "NumericalMeasureField": {
-                "FieldId": f"{visual_id}-v",
-                "Column": {"DataSetIdentifier": dataset, "ColumnName": value_col},
-                "AggregationFunction": {"SimpleNumericalAggregation": "SUM"},
-            },
-        }],
-    }
-    area_config = {
-        "Type": "STACKED_AREA",
-        "FieldWells": {"LineChartAggregatedFieldWells": field_wells},
-    }
-    if stack_col:
-        field_wells["Colors"] = [{
-            "CategoricalDimensionField": {
-                "FieldId": f"{visual_id}-c",
-                "Column": {"DataSetIdentifier": dataset, "ColumnName": stack_col},
-            },
-        }]
-        cmap = _color_map(f"{visual_id}-c", stack_col)
-        if cmap:
-            area_config["VisualPalette"] = {"ColorMap": cmap}
-    return {
-        "LineChartVisual": {
-            "VisualId": visual_id,
-            "Title": {"Visibility": "VISIBLE", "FormatText": {"PlainText": title}},
-            "ChartConfiguration": area_config,
-        },
-    }
-
-
 def _bar_time_stacked(visual_id: str, title: str, dataset: str, date_col: str,
                       value_col: str, stack_col: str | None = None,
                       arrangement: str = "STACKED", agg: str = "SUM"):
     """Vertical bar over a daily date axis, optionally split by `stack_col`.
-    Replaces _area()/_line(): sparse data reads as discrete per-day bars
-    instead of a filled area or an interpolated line that invents usage on
-    days with no data. `arrangement` is STACKED or CLUSTERED - use CLUSTERED
+    Bars rather than an area or line chart on purpose: sparse data reads as
+    discrete per-day values instead of a filled area or an interpolated line
+    that invents usage on days with no data. `arrangement` is STACKED or CLUSTERED - use CLUSTERED
     when the split series must NOT be summed (e.g. distinct active users by
     client, where a cross-client user would be double-counted by a stack)."""
     field_wells = {
@@ -875,8 +442,7 @@ def _bar_time_multi(visual_id: str, title: str, dataset: str, date_col: str,
                     agg: str = "SUM", legend_title: str | None = None,
                     series_colors: list[str] | None = None):
     """Vertical bar over a daily date axis with multiple value series (one
-    measure per (column, label) pair). Bar-chart replacement for _line_multi -
-    e.g. new vs returning users, where the two series are separate columns and
+    measure per (column, label) pair) - e.g. new vs returning users, where the two series are separate columns and
     STACKED gives the meaningful total (new + returning = daily active).
     `legend_title` overrides the legend heading: multi-series charts have no
     color DIMENSION to name the legend, so QuickSight otherwise prints the
@@ -938,73 +504,6 @@ def _bar_time_multi(visual_id: str, title: str, dataset: str, date_col: str,
             "VisualId": visual_id,
             "Title": {"Visibility": "VISIBLE", "FormatText": {"PlainText": title}},
             "ChartConfiguration": bar_config,
-        },
-    }
-
-
-def _donut(visual_id: str, title: str, dataset: str, category_col: str, count_col: str):
-    return {
-        "PieChartVisual": {
-            "VisualId": visual_id,
-            "Title": {"Visibility": "VISIBLE", "FormatText": {"PlainText": title}},
-            "ChartConfiguration": {
-                "FieldWells": {
-                    "PieChartAggregatedFieldWells": {
-                        "Category": [{
-                            "CategoricalDimensionField": {
-                                "FieldId": f"{visual_id}-c",
-                                "Column": {"DataSetIdentifier": dataset, "ColumnName": category_col},
-                            },
-                        }],
-                        "Values": [{
-                            "CategoricalMeasureField": {
-                                "FieldId": f"{visual_id}-v",
-                                "Column": {"DataSetIdentifier": dataset, "ColumnName": count_col},
-                                "AggregationFunction": "DISTINCT_COUNT",
-                            },
-                        }],
-                    },
-                },
-                "DonutOptions": {
-                    "ArcOptions": {"ArcThickness": "MEDIUM"},
-                },
-            },
-        },
-    }
-
-
-def _heatmap(visual_id: str, title: str, dataset: str, rows_col: str, cols_col: str,
-             value_col: str):
-    return {
-        "HeatMapVisual": {
-            "VisualId": visual_id,
-            "Title": {"Visibility": "VISIBLE", "FormatText": {"PlainText": title}},
-            "ChartConfiguration": {
-                "FieldWells": {
-                    "HeatMapAggregatedFieldWells": {
-                        "Rows": [{
-                            "DateDimensionField": {
-                                "FieldId": f"{visual_id}-r",
-                                "Column": {"DataSetIdentifier": dataset, "ColumnName": rows_col},
-                                "DateGranularity": "DAY",
-                            },
-                        }],
-                        "Columns": [{
-                            "CategoricalDimensionField": {
-                                "FieldId": f"{visual_id}-c",
-                                "Column": {"DataSetIdentifier": dataset, "ColumnName": cols_col},
-                            },
-                        }],
-                        "Values": [{
-                            "NumericalMeasureField": {
-                                "FieldId": f"{visual_id}-v",
-                                "Column": {"DataSetIdentifier": dataset, "ColumnName": value_col},
-                                "AggregationFunction": {"SimpleNumericalAggregation": "SUM"},
-                            },
-                        }],
-                    },
-                },
-            },
         },
     }
 
@@ -1210,49 +709,6 @@ def _pivot(visual_id: str, title: str, dataset: str,
                     "SingleMetricVisibility": "HIDDEN",
                     "ToggleButtonsVisibility": "HIDDEN",
                 },
-            },
-        },
-    }
-
-
-def _funnel(visual_id: str, title: str, dataset: str, stage_col: str, value_col: str,
-            sort_col: str = "sort_key"):
-    """Native FunnelChartVisual. Stages are ordered by `sort_col` ascending
-    so the visual reads top-to-bottom (e.g. New -> Active -> Power), not by
-    value descending (which would scramble the funnel on healthy populations
-    where Active > New > Power)."""
-    return {
-        "FunnelChartVisual": {
-            "VisualId": visual_id,
-            "Title": {"Visibility": "VISIBLE", "FormatText": {"PlainText": title}},
-            "ChartConfiguration": {
-                "FieldWells": {
-                    "FunnelChartAggregatedFieldWells": {
-                        "Category": [{
-                            "CategoricalDimensionField": {
-                                "FieldId": f"{visual_id}-c",
-                                "Column": {"DataSetIdentifier": dataset, "ColumnName": stage_col},
-                            },
-                        }],
-                        "Values": [{
-                            "NumericalMeasureField": {
-                                "FieldId": f"{visual_id}-v",
-                                "Column": {"DataSetIdentifier": dataset, "ColumnName": value_col},
-                                "AggregationFunction": {"SimpleNumericalAggregation": "SUM"},
-                            },
-                        }],
-                    },
-                },
-                "SortConfiguration": {
-                    "CategorySort": [{
-                        "ColumnSort": {
-                            "SortBy": {"DataSetIdentifier": dataset, "ColumnName": sort_col},
-                            "Direction": "ASC",
-                            "AggregationFunction": {"NumericalAggregationFunction": {"SimpleNumericalAggregation": "MIN"}},
-                        },
-                    }],
-                },
-                "DataLabelOptions": {"Visibility": "VISIBLE"},
             },
         },
     }

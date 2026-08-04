@@ -379,49 +379,6 @@ Resources:
             - quicksight:UpdateDataSetPermissions
 
   # ---------------------------------------------------------------------------
-  # DataSet over engagement_segmentation - 30-day per-user segment
-  # (New / Active / Power). Powers the engagement donut.
-  # ---------------------------------------------------------------------------
-  EngagementDataSet:
-    Type: AWS::QuickSight::DataSet
-    Properties:
-      AwsAccountId: !Ref AWS::AccountId
-      DataSetId: !Sub "${ResourcePrefix}-engagement"
-      Name: Kiro - Engagement
-      ImportMode: SPICE
-      PhysicalTableMap:
-        base:
-          RelationalTable:
-            DataSourceArn: !GetAtt AthenaDataSource.Arn
-            Catalog: AwsDataCatalog
-            Schema: !Ref GlueDatabase
-            Name: engagement_segmentation
-            InputColumns:
-              - { Name: user_id,           Type: STRING }
-              - { Name: user_label,        Type: STRING }
-              - { Name: subscription_tier, Type: STRING }
-              - { Name: active_days_30d,   Type: INTEGER }
-              - { Name: messages_30d,      Type: INTEGER }
-              - { Name: is_active,         Type: INTEGER }
-              - { Name: segment,           Type: STRING }
-      Permissions:
-        - Principal: !Ref QuickSightPrincipalArn
-          Actions:
-            - quicksight:DescribeDataSet
-            - quicksight:DescribeDataSetPermissions
-            - quicksight:PassDataSet
-            - quicksight:DescribeIngestion
-            - quicksight:ListIngestions
-            - quicksight:UpdateDataSet
-            - quicksight:DeleteDataSet
-            - quicksight:CreateIngestion
-            - quicksight:CancelIngestion
-            - quicksight:UpdateDataSetPermissions
-
-  # ---------------------------------------------------------------------------
-  # DataSet over model_usage - daily per-user-per-model message
-  # counts. Drives the model picker and stacked-area visuals.
-  # ---------------------------------------------------------------------------
   ModelUsageDataSet:
     Type: AWS::QuickSight::DataSet
     Properties:
@@ -500,57 +457,6 @@ Resources:
             - quicksight:CancelIngestion
             - quicksight:UpdateDataSetPermissions
 
-  # ---------------------------------------------------------------------------
-  # DataSet over period_comparison - current vs prior 30d totals by
-  # tier. Powers the Executive sheet comparison table.
-  # ---------------------------------------------------------------------------
-  PeriodComparisonDataSet:
-    Type: AWS::QuickSight::DataSet
-    Properties:
-      AwsAccountId: !Ref AWS::AccountId
-      DataSetId: !Sub "${ResourcePrefix}-period-comparison"
-      Name: Kiro - Period Comparison (current vs prior 30d)
-      ImportMode: SPICE
-      PhysicalTableMap:
-        base:
-          RelationalTable:
-            DataSourceArn: !GetAtt AthenaDataSource.Arn
-            Catalog: AwsDataCatalog
-            Schema: !Ref GlueDatabase
-            Name: period_comparison
-            InputColumns:
-              - { Name: period,            Type: STRING }
-              - { Name: sort_key,          Type: INTEGER }
-              - { Name: subscription_tier, Type: STRING }
-              - { Name: messages,          Type: INTEGER }
-              - { Name: credits_used,      Type: DECIMAL }
-      Permissions:
-        - Principal: !Ref QuickSightPrincipalArn
-          Actions:
-            - quicksight:DescribeDataSet
-            - quicksight:DescribeDataSetPermissions
-            - quicksight:PassDataSet
-            - quicksight:DescribeIngestion
-            - quicksight:ListIngestions
-            - quicksight:UpdateDataSet
-            - quicksight:DeleteDataSet
-            - quicksight:CreateIngestion
-            - quicksight:CancelIngestion
-            - quicksight:UpdateDataSetPermissions
-
-  # NOTE: the cohort_retention dataset (and its Athena view) were removed. The
-  # cohort-retention chart needed many months of history to be meaningful and
-  # did not read clearly; the retention/drift signal is covered by the
-  # engagement-segments "Idle" bucket and the week-over-week "at-risk" flag.
-  #
-  # NOTE: the engagement_funnel dataset was removed. The People-sheet funnel was
-  # reworked from a native funnel chart (reading this SPICE dataset) into three
-  # date-range-driven KPI tiles computed from base-user-activity via calculated
-  # fields in scripts/create_dashboard.py, so this dataset is no longer used.
-
-  # ---------------------------------------------------------------------------
-  # DataSet over activity_heatmap - daily user / message / credit
-  # totals by tier. Powers the Activity & Trends area chart.
   # ---------------------------------------------------------------------------
   ActivityHeatmapDataSet:
     Type: AWS::QuickSight::DataSet
@@ -646,22 +552,6 @@ Resources:
         ScheduleFrequency: { Interval: DAILY, TimeOfTheDay: "04:15" }
 
   # ---------------------------------------------------------------------------
-  # Daily refresh - engagement_segmentation.
-  # ---------------------------------------------------------------------------
-  EngagementRefreshSchedule:
-    Type: AWS::QuickSight::RefreshSchedule
-    DependsOn: EngagementDataSet
-    Properties:
-      AwsAccountId: !Ref AWS::AccountId
-      DataSetId: !Sub "${ResourcePrefix}-engagement"
-      Schedule:
-        ScheduleId: daily
-        RefreshType: FULL_REFRESH
-        ScheduleFrequency: { Interval: DAILY, TimeOfTheDay: "04:20" }
-
-  # ---------------------------------------------------------------------------
-  # Daily refresh - model_usage.
-  # ---------------------------------------------------------------------------
   ModelUsageRefreshSchedule:
     Type: AWS::QuickSight::RefreshSchedule
     DependsOn: ModelUsageDataSet
@@ -687,27 +577,6 @@ Resources:
         RefreshType: FULL_REFRESH
         ScheduleFrequency: { Interval: DAILY, TimeOfTheDay: "04:35" }
 
-  # ---------------------------------------------------------------------------
-  # Daily refresh - period_comparison.
-  # ---------------------------------------------------------------------------
-  PeriodComparisonRefreshSchedule:
-    Type: AWS::QuickSight::RefreshSchedule
-    DependsOn: PeriodComparisonDataSet
-    Properties:
-      AwsAccountId: !Ref AWS::AccountId
-      DataSetId: !Sub "${ResourcePrefix}-period-comparison"
-      Schedule:
-        ScheduleId: daily
-        RefreshType: FULL_REFRESH
-        ScheduleFrequency: { Interval: DAILY, TimeOfTheDay: "05:00" }
-
-  # (cohort_retention refresh schedule removed alongside its dataset/view.)
-
-  # (engagement_funnel refresh schedule removed alongside its dataset - the
-  # People funnel is now KPI tiles over base-user-activity.)
-
-  # ---------------------------------------------------------------------------
-  # Daily refresh - wow_movers.
   # ---------------------------------------------------------------------------
   MoversRefreshSchedule:
     Type: AWS::QuickSight::RefreshSchedule
@@ -743,8 +612,6 @@ Outputs:
   DailyTrendsDataSetArn:      { Value: !GetAtt DailyTrendsDataSet.Arn }
   UserTotalsDataSetArn:       { Value: !GetAtt UserTotalsDataSet.Arn }
   TierBreakdownDataSetArn:    { Value: !GetAtt TierBreakdownDataSet.Arn }
-  EngagementDataSetArn:       { Value: !GetAtt EngagementDataSet.Arn }
   ModelUsageDataSetArn:       { Value: !GetAtt ModelUsageDataSet.Arn }
   WowMoversDataSetArn:        { Value: !GetAtt WowMoversDataSet.Arn }
   ActivityHeatmapDataSetArn:  { Value: !GetAtt ActivityHeatmapDataSet.Arn }
-  PeriodComparisonDataSetArn: { Value: !GetAtt PeriodComparisonDataSet.Arn }

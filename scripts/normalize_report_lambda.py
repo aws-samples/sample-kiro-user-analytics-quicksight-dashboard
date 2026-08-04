@@ -54,11 +54,18 @@ OpenCSVSerDe with skip.header.line.count=1 and partition projection on
 export_date. Positional parsing is safe DOWNSTREAM because WE author these
 parts with a fixed, known column order.
 
-Fail-closed: a per-file failure aborts that file (its prior good part stays in
-place); we NEVER delete existing output - this Lambda issues no S3 delete of any
-kind, by design, because it runs against a customer's own bucket. Partially
-processed runs are safe because each file's part is written atomically and the
-Athena dedup view only ever surfaces the latest export per key. A superseded
+Fail-closed, per FILE not per RUN: each file is normalized inside its own
+try/except, so one malformed export cannot stop the others. Failures are
+collected and the invocation then raises, which keeps the run visibly failed
+(non-zero Lambda Errors, so an alarm can fire) while still landing every file
+that parsed. That combination matters - isolating the bad file must not silently
+turn a broken run into a successful one, and letting the exception escape mid-loop
+used to leave every LATER file unprocessed on this and all future runs.
+
+We NEVER delete existing output - this Lambda issues no S3 delete of any kind, by
+design, because it runs against a customer's own bucket. Partially processed runs
+are safe because each file's part is written atomically and the Athena dedup view
+only ever surfaces the latest export per key. A superseded
 part therefore lingers as unreachable storage rather than being removed;
 reclaiming it (S3 lifecycle, or manual clean-up + REPROCESS_ALL) is a customer
 decision, and the normalized output is fully regenerable from the raw exports.
@@ -314,44 +321,85 @@ def handler(event, context):  # noqa: ARG001 - Lambda signature
     skipped = 0
     fact_total = 0
     model_total = 0
+    failures: list[dict] = []
 
     for obj in objects:
         src_key = obj["Key"]
-        etag = obj["ETag"]
-        export_date = _export_date(src_key)
-        part = _part_name(src_key, etag)
-        facts_key = f"{out_prefix}/facts/export_date={export_date}/{part}"
-        models_key = f"{out_prefix}/models/export_date={export_date}/{part}"
+        # ONE file's failure must not abort the run. Objects are iterated in S3
+        # lexicographic order, so without this guard an exception on file N left
+        # files N+1..end unprocessed - and because the skip sentinel is keyed on
+        # (key, ETag) and the source ETag never changes, EVERY later run failed
+        # at the same file too. The pipeline stopped permanently, silently: it
+        # "fails closed", so the dashboard kept serving yesterday's data rather
+        # than showing an error. One malformed export could freeze the dashboard
+        # indefinitely with nobody told. (Reproduced with an unterminated quote
+        # in a >128KB file -> _csv.Error, a non-UTF-8 byte -> UnicodeDecodeError,
+        # and a non-finite count -> OverflowError.)
+        #
+        # Catching per file makes the module docstring's "a per-file failure
+        # aborts that file" claim actually true. We still RAISE at the end so the
+        # invocation is visibly failed (Lambda Errors metric, alarms, retries) -
+        # isolating the bad file must not silently downgrade a broken run to a
+        # successful one.
+        try:
+            etag = obj["ETag"]
+            export_date = _export_date(src_key)
+            part = _part_name(src_key, etag)
+            facts_key = f"{out_prefix}/facts/export_date={export_date}/{part}"
+            models_key = f"{out_prefix}/models/export_date={export_date}/{part}"
 
-        # Incremental skip: a part keyed by (src_key, ETag) already existing
-        # means this exact file content was normalized before. A re-exported
-        # file with changed content has a different ETag -> new part -> it is
-        # reprocessed (self-healing). The superseded part is left in place (we
-        # never delete from a customer bucket); the dedup views rank on
-        # processed_ts so only the newest part is reachable.
-        if not reprocess_all and _exists(s3, out_bucket, facts_key):
-            skipped += 1
-            continue
+            # Incremental skip: a part keyed by (src_key, ETag) already existing
+            # means this exact file content was normalized before. A re-exported
+            # file with changed content has a different ETag -> new part -> it is
+            # reprocessed (self-healing). The superseded part is left in place (we
+            # never delete from a customer bucket); the dedup views rank on
+            # processed_ts so only the newest part is reachable.
+            if not reprocess_all and _exists(s3, out_bucket, facts_key):
+                skipped += 1
+                continue
 
-        body = s3.get_object(Bucket=raw_bucket, Key=src_key)["Body"].read().decode(
-            "utf-8-sig"  # tolerate a UTF-8 BOM on the header cell
-        )
-        fact_rows, model_rows = _parse_file(body, src_key, part, processed_ts)
+            body = s3.get_object(Bucket=raw_bucket, Key=src_key)["Body"].read().decode(
+                "utf-8-sig"  # tolerate a UTF-8 BOM on the header cell
+            )
+            fact_rows, model_rows = _parse_file(body, src_key, part, processed_ts)
 
-        # Write models first then facts: the facts part is the skip sentinel
-        # (checked above), so writing it LAST means a mid-file crash never
-        # leaves a facts part without its matching models part.
-        _write_csv(s3, out_bucket, models_key, _MODEL_OUT_HEADER, model_rows)
-        _write_csv(s3, out_bucket, facts_key, _FACT_OUT_HEADER, fact_rows)
+            # Write models first then facts: the facts part is the skip sentinel
+            # (checked above), so writing it LAST means a mid-file crash never
+            # leaves a facts part without its matching models part.
+            _write_csv(s3, out_bucket, models_key, _MODEL_OUT_HEADER, model_rows)
+            _write_csv(s3, out_bucket, facts_key, _FACT_OUT_HEADER, fact_rows)
 
-        processed += 1
-        fact_total += len(fact_rows)
-        model_total += len(model_rows)
+            processed += 1
+            fact_total += len(fact_rows)
+            model_total += len(model_rows)
+        except Exception as exc:  # noqa: BLE001 - deliberately broad; see above
+            # Log the key and the exception TYPE only. The message can echo file
+            # content (csv errors quote the offending field), and this log group
+            # is not PII-scoped.
+            failures.append({"key": src_key, "error": type(exc).__name__})
+            print(f"FAILED to normalize {src_key}: {type(exc).__name__}")
 
-    return {
+    result = {
         "files_seen": len(objects),
         "files_processed": processed,
         "files_skipped": skipped,
+        "files_failed": len(failures),
         "fact_rows_written": fact_total,
         "model_rows_written": model_total,
     }
+
+    if failures:
+        # Every other file has been normalized and its parts are durable, so the
+        # good data is already in place; this raise exists to make the failure
+        # OBSERVABLE (non-zero Lambda Errors -> alarm) rather than to undo work.
+        # A file listed here will be retried on the next scheduled run, and will
+        # keep failing until the source file is corrected - so the alarm is the
+        # signal to go and look at it.
+        raise RuntimeError(
+            f"Normalized {processed} file(s), skipped {skipped}, "
+            f"FAILED {len(failures)}: "
+            + ", ".join(f"{f['key']} ({f['error']})" for f in failures[:10])
+            + (" ..." if len(failures) > 10 else "")
+        )
+
+    return result

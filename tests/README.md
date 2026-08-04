@@ -33,6 +33,29 @@ them (with a notice) when they are not.
 | `test_versioning.py` | `VERSION`/`CHANGELOG` agreement, every stack tagged, and the tag **merge** | `aws cloudformation deploy --tags` replaces rather than merges, so stamping a version tag would silently delete a customer's own cost-allocation tags — visible only weeks later in a billing report |
 | `test_cost_docs.py` | The README cost table recomputed from its own stated unit prices | A cost figure edited in one cell and left stale in another. Someone budgets from that table, so an inconsistent number is worse than no table |
 
+## What these tests deliberately cannot catch
+
+Being offline is the point, and it has one consequence worth stating outright:
+`test_cost_docs.py` reads only the README, so it detects internal
+**inconsistency** and never **staleness**. If AWS reprices a QuickSight reader
+tomorrow, all of its assertions still pass while the entire Cost section is
+wrong. No offline test can see that.
+
+The mitigations are deliberate rather than accidental: the figures are labelled
+`us-east-1` list price, the authoritative pricing pages are linked, and
+**`scripts/check_pricing.py`** diffs every documented price against the live AWS
+Price List API. That script is intentionally *not* in `run-checks.sh` or CI - it
+needs credentials and network, so it would fail for contributors without AWS
+access and break fork PRs, and AWS changing a price is not a contributor's fault.
+It runs at each release instead (see CONTRIBUTING.md "Versioning"), and tests
+here pin the script's expected prices to the README's so the two cannot drift
+apart silently.
+
+The script also reports what it *cannot* verify: the Price List API publishes no
+SKU for the plain $24 Author price, so that one needs a human glance at the
+pricing page. Checking a subset while implying the whole section was validated
+would be worse than saying so.
+
 ## Conventions
 
 Tests import the scripts directly from `scripts/` — there is no package to

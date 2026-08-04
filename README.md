@@ -14,8 +14,6 @@ This dashboard answers questions about how Kiro is *used*:
 
 For Kiro **cost and seat utilization** questions (per-user spend, idle seats, billing roll-ups), use the Kiro module in the [Cloud Intelligence Dashboards (CUDOS)](https://github.com/aws-solutions-library-samples/cloud-intelligence-dashboards-framework). Deploy both side-by-side for the full picture.
 
-What it costs to *run this dashboard* is a separate question, answered in [Cost](#cost): the pipeline is about $0.05/month, and Amazon QuickSight reader licences are the entire budget decision.
-
 > **Note:** This solution targets the **modern Kiro User Activity Report** export. The legacy `by_user_analytic` report (from Amazon Q Developer) is not supported - Amazon Q Developer reaches end-of-support per the [AWS announcement](https://aws.amazon.com/blogs/devops/amazon-q-developer-end-of-support-announcement/), and this dashboard is built only on the supported `user_report` schema.
 
 ## Architecture diagram
@@ -278,7 +276,13 @@ The solution is layered:
 
 **The data pipeline is not what this costs. Amazon QuickSight user licences are, by three to four orders of magnitude.** Budget by counting the people you will entitle as readers, not by estimating data volume.
 
-All figures are `us-east-1` list price, measured on real deployments of this sample. Verify against the [QuickSight](https://aws.amazon.com/quicksight/pricing/), [Athena](https://aws.amazon.com/athena/pricing/), [Lambda](https://aws.amazon.com/lambda/pricing/) and [S3](https://aws.amazon.com/s3/pricing/) pricing pages for your Region and negotiated rates.
+All figures are `us-east-1` list price, measured on real deployments of this sample and checked against the AWS Price List API. **Prices change and these numbers can go stale** — verify against the [QuickSight](https://aws.amazon.com/quicksight/pricing/), [Athena](https://aws.amazon.com/athena/pricing/), [Lambda](https://aws.amazon.com/lambda/pricing/) and [S3](https://aws.amazon.com/s3/pricing/) pricing pages for your Region and negotiated rates. To re-verify what this repo claims against what AWS currently charges:
+
+```bash
+python3 scripts/check_pricing.py
+```
+
+That compares each documented price to the live Price List API and exits non-zero on drift. Run it if these figures look wrong, or before relying on them for a budget.
 
 ### The pipeline: about $0.05/month
 
@@ -457,7 +461,7 @@ scripts/run-checks.sh
 
 That runs everything CI runs, offline — no AWS account, no credentials, no network — in a couple of seconds:
 
-* **Unit tests** (`python3 -m unittest discover -s tests`) covering the invariants whose violation is *silent* on the dashboard: header-keyed CSV parsing as Kiro's export drifts, tier-label rendering, view dependency ordering, the dataset inventories that drive the identity-mapping opt-out, IAM policy rendering, version stamping (including that adding the version tag does not wipe a customer's own stack tags), the cost table's internal arithmetic, and the dashboard definition's internal consistency.
+* **Unit tests** (`python3 -m unittest discover -s tests`) covering the invariants whose violation is *silent* on the dashboard: header-keyed CSV parsing as Kiro's export drifts, tier-label rendering, view dependency ordering, the dataset inventories that drive the identity-mapping opt-out, IAM policy rendering, version stamping (including that adding the version tag does not wipe a customer's own stack tags), and the dashboard definition's internal consistency.
 * **Shell syntax under bash 3.2 as well as bash 5** — macOS still ships 3.2, and the scripts deliberately avoid bash-4 syntax.
 * **A portability gate** rejecting bash-4-only constructs (`mapfile`, `declare -A`, `${var,,}`) and GNU-only tool usage (`sed -i`, `date -d`, `grep -P`).
 * **`shellcheck`** and **`cfn-lint`** when installed; skipped with a notice when not, so a missing linter never blocks you locally. CI installs both.

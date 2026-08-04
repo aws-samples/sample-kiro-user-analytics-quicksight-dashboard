@@ -58,6 +58,12 @@ release and is recorded so an existing deployment can be placed in history.
   about. Also documents the flat **$250/month** account fee triggered by any Pro
   user or Amazon Q in QuickSight (~6,000× the pipeline), with the CLI command to
   check whether it already applies.
+- `scripts/check_pricing.py`, which diffs the README's documented prices against
+  the live AWS Price List API and exits non-zero on drift. The offline tests can
+  only catch a cost figure that contradicts its own table; they cannot notice AWS
+  repricing, which would leave every test green and the whole Cost section wrong.
+  Run at each release (see CONTRIBUTING.md); deliberately not in CI, since it
+  needs credentials and a price change is not a contributor's fault.
 - Offline test suite (83 tests) and GitHub Actions CI covering the bug classes
   that fail *silently* on the dashboard: dataset-inventory drift, tier-label
   handling, per-user-constant columns, view creation order, IAM policy shape and

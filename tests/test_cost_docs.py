@@ -1,0 +1,129 @@
+"""The cost section's arithmetic must be internally consistent.
+
+A wrong number in a cost table is worse than no cost table: someone budgets from
+it. The figures were measured against live deployments and verified against the
+AWS Price List API, but nothing stops a later edit from changing one cell and
+leaving the rest — so the licence table is recomputed here from the unit prices
+the section itself states.
+
+This does NOT check AWS's prices (they change, and a test that fails when AWS
+reprices would be noise). It checks that the README is consistent with itself:
+if the stated per-user prices don't produce the stated totals, one of them is
+wrong.
+"""
+from __future__ import annotations
+
+import re
+import unittest
+
+from _helpers import REPO
+
+README = (REPO / "README.md").read_text()
+
+
+def cost_section() -> str:
+    body = README.split("\n## Cost\n", 1)
+    assert len(body) == 2, "README has no '## Cost' section"
+    return body[1].split("\n## ", 1)[0]
+
+
+SECTION = cost_section()
+
+
+def money(text: str) -> list[int]:
+    """Whole-dollar amounts, ignoring cents figures and prices-per-TB."""
+    return [int(m.replace(",", ""))
+            for m in re.findall(r"\$([0-9][0-9,]*)(?![0-9.]*\d\s*/\s*TB)(?!\.\d)", text)]
+
+
+class TestLicenceArithmetic(unittest.TestCase):
+    """Recompute the licence table from the unit prices the section states."""
+
+    AUTHOR, READER, FLAT = 24, 3, 250
+
+    def test_stated_unit_prices_are_present(self):
+        """If a unit price is edited, the expectations below must be revisited -
+        so assert the prices this test assumes actually appear in the text."""
+        for price in (self.AUTHOR, self.READER, self.FLAT):
+            with self.subTest(price=price):
+                self.assertIn(f"${price}", SECTION)
+
+    def test_licence_table_totals_are_correct(self):
+        table = SECTION.split("### QuickSight licences", 1)[1].split("###", 1)[0]
+        rows = re.findall(r"\|\s*1 author(?:,| \+) ([\d,]+|no) readers?[^|]*\|\s*\*{0,2}\$([\d,]+)",
+                          table)
+        self.assertGreaterEqual(len(rows), 4, f"could not parse licence rows: {table[:400]}")
+        for readers_txt, total_txt in rows:
+            readers = 0 if readers_txt == "no" else int(readers_txt.replace(",", ""))
+            expected = self.AUTHOR + readers * self.READER
+            with self.subTest(readers=readers):
+                self.assertEqual(int(total_txt.replace(",", "")), expected,
+                                 f"{readers} readers should be ${expected}")
+
+    def test_the_multiplier_claim_matches_the_table(self):
+        """The headline trap: entitling every seat instead of ~25 people."""
+        m = re.search(r"\*\*(\d+)× bill increase\*\*", SECTION)
+        self.assertIsNotNone(m, "no 'N× bill increase' claim found")
+        small = self.AUTHOR + 25 * self.READER
+        big = self.AUTHOR + 8000 * self.READER
+        self.assertEqual(int(m.group(1)), round(big / small))
+
+    def test_both_endpoints_of_the_multiplier_are_shown(self):
+        """A ratio with no absolute numbers is unactionable."""
+        for amount in ("$99", "$24,024"):
+            with self.subTest(amount=amount):
+                self.assertIn(amount, SECTION)
+
+
+class TestPipelineFraming(unittest.TestCase):
+
+    def test_licences_are_named_as_the_dominant_cost(self):
+        """The one thing a reader must take away. Pipeline cost is a rounding
+        error; budgeting from it is the mistake this section exists to prevent."""
+        opening = SECTION.split("###", 1)[0].lower()
+        self.assertIn("licence", opening)
+        self.assertIn("reader", opening)
+
+    def test_the_flat_fee_is_documented_with_its_trigger(self):
+        """$250/month applies account-wide and is ~6000x the pipeline, so it
+        must be attributable - otherwise it gets blamed on this sample."""
+        self.assertIn("$250", SECTION)
+        self.assertRegex(SECTION, r"(?i)pro user")
+        self.assertRegex(SECTION, r"(?i)amazon q")
+
+    def test_a_pro_user_detection_command_is_given(self):
+        """Naming a charge without a way to check for it is not actionable."""
+        self.assertIn("list-users", SECTION)
+        self.assertIn("PRO", SECTION)
+
+    def test_retained_kms_key_cost_is_disclosed(self):
+        """A retained CMK bills $1/month forever - 25x this pipeline - and
+        teardown deliberately leaves it behind."""
+        self.assertRegex(SECTION, r"\$1/month")
+
+
+class TestReducingCost(unittest.TestCase):
+
+    def test_reader_count_is_the_first_recommendation(self):
+        """Ordering is the advice. Anything above 'entitle fewer readers'
+        would be optimising a rounding error."""
+        steps = SECTION.split("### Reducing cost", 1)[1]
+        first = re.search(r"^1\.\s+\*\*(.+?)\*\*", steps, re.M)
+        self.assertIsNotNone(first, "no numbered recommendations found")
+        self.assertRegex(first.group(1), r"(?i)reader")
+
+
+class TestCostSectionIsLinked(unittest.TestCase):
+
+    def test_cost_section_has_a_heading_anchor_target(self):
+        self.assertIn("## Cost", README)
+
+    def test_pricing_pages_are_referenced(self):
+        """List prices go stale; the authoritative source must be one click
+        away and the figures must be labelled as list price."""
+        self.assertIn("aws.amazon.com/quicksight/pricing", SECTION)
+        self.assertRegex(SECTION, r"(?i)list price")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -126,14 +126,21 @@ Resources:
         Rules:
           # Scope expiry to query-results/ ONLY. The normalized/ prefix holds
           # the persistent, date-partitioned facts/models the dashboard reads -
-          # it must NOT expire. (Old query scratch is transient; 30 days is
-          # plenty.) An unscoped rule here would silently delete normalized
-          # partitions older than 30 days.
+          # it must NOT expire. An unscoped rule here would silently delete
+          # normalized partitions older than 30 days.
+          #
+          # 7 days, not 30: these results are pure scratch (Athena rewrites them
+          # on every query, and nothing in the solution reads them back), but
+          # when IDENTITY_MAPPING is on they contain resolved names and email
+          # addresses - every SPICE refresh of a user-facing dataset writes a
+          # full result set here. Shortening the window is the cheapest way to
+          # bound that exposure without adding a CMK and its key policy to every
+          # deployment. See SECURITY.md "Containment and isolation".
           - Id: ExpireQueryResults
             Status: Enabled
             Prefix: query-results/
-            ExpirationInDays: 30
-            NoncurrentVersionExpirationInDays: 7
+            ExpirationInDays: 7
+            NoncurrentVersionExpirationInDays: 1
           # Normalized parts are retained, but keep noncurrent versions from
           # accumulating forever (each daily re-write of a partition part makes
           # the prior a noncurrent version).

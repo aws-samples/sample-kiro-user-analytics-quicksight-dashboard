@@ -671,14 +671,13 @@ python3 "${ROOT}/scripts/create_dashboard.py" \
 # to QS_ALL_DATASETS; if its view selects user_label, add it to
 # QS_LABEL_DATASETS too (QS_LABEL_DATASETS must be a subset of QS_ALL_DATASETS).
 QS_ALL_DATASETS=(
-    base-user-activity daily-trends user-totals tier-breakdown engagement
-    model-usage wow-movers period-comparison activity-heatmap user-daily-dense
+    base-user-activity daily-trends user-totals tier-breakdown
+    model-usage wow-movers activity-heatmap user-daily-dense
 )
 # The subset whose views resolve user_label (verified against the InputColumns
 # in cfn/02-quicksight.yaml). These are the only ones that can hold PII.
 QS_LABEL_DATASETS=(
-    base-user-activity user-totals engagement model-usage wow-movers
-    user-daily-dense
+    base-user-activity user-totals model-usage wow-movers user-daily-dense
 )
 
 # 6b) When identity mapping is ON, force a SPICE refresh of the datasets whose

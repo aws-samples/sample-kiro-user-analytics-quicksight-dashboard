@@ -12,7 +12,7 @@ WITH window_bound AS (
 -- and understating real declines - measured at -2,649 messages cohort-wide when
 -- the true 7-vs-7 figure was -5,562. Worse, the bias flipped depending on which
 -- weekday the latest export landed on, so the metric was not comparable between
--- refreshes. `>` gives exactly 7 days, matching `prior` and 0c_period_comparison.
+-- refreshes. `>` gives exactly 7 days, matching `prior`.
 recent AS (
     SELECT b.user_id, SUM(b.total_messages) AS messages
     FROM ${database}.base_user_activity b, window_bound w

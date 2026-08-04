@@ -69,9 +69,9 @@ _AUTO_NUMBER_FORMAT = {
 # build_views.py (Free/Pro/Pro+/Pro Max/Power/Unknown),
 # client_type is upper()'d (KIRO_IDE/KIRO_CLI/PLUGIN). A value not in the map
 # falls back to normal palette assignment, so new client types still render.
-# Kiro brand purple - the "primary/now/headline" convention. Used for Power
-# tier, the current-period comparison bar, and as the explicit fill for
-# single-series bars (which would otherwise inherit palette slot 1).
+# Kiro brand purple - the "primary/now/headline" convention. Used for the Power
+# tier, and as the explicit fill for single-series bars (which would otherwise
+# inherit palette slot 1).
 _BRAND_PURPLE = "#9046FF"
 # Secondary/"prior/other" convention colour, paired with brand purple on
 # two-series charts (e.g. new vs returning, in-plan vs overage).

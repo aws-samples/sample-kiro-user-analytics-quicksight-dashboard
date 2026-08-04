@@ -59,9 +59,27 @@ Parameters:
       the Kiro export (02:00 UTC) and before the 03:30 identity-map / 04:00
       SPICE refreshes, so normalized data is current for each day's ingest.
 
+  AlarmEmail:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    ConstraintDescription: Must be a valid email address, or left blank.
+    Description: >
+      Optional. Email address to notify when the report-normalizer fails or
+      stops running. Strongly recommended: the pipeline fails CLOSED, so
+      without an alarm a broken normalizer looks identical to a quiet day -
+      the dashboard keeps serving the last good data and nobody is told.
+      AWS sends a subscription-confirmation email that must be accepted
+      before notifications are delivered. Leave blank to skip alarms
+      entirely (no SNS topic is created).
+
 Conditions:
   HasKmsKey: !Not [!Equals [!Ref KmsKeyArn, ""]]
   HasNormalizerCode: !Not [!Equals [!Ref NormalizerLambdaCodeS3Key, ""]]
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+  # Alarms reference the Lambda by name, so they can only exist once the
+  # function does (i.e. after deploy.sh stages the code zip).
+  HasAlarms: !And [!Condition HasAlarmEmail, !Condition HasNormalizerCode]
 
 Resources:
 
@@ -309,6 +327,89 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt NormalizeRule.Arn
 
+  # ---------------------------------------------------------------------------
+  # Observability.
+  #
+  # The pipeline fails CLOSED: if the normalizer breaks, the previous normalized
+  # output stays in place and the dashboard keeps serving it. That is the right
+  # data behaviour, but it means a broken pipeline is indistinguishable from a
+  # quiet day - the only symptom is a max date that stops advancing, which
+  # nobody watches. These three resources make failure visible.
+  # ---------------------------------------------------------------------------
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlarmEmail
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-alarms"
+      DisplayName: Kiro analytics pipeline alarms
+      # SSE with the AWS-managed SNS key: alarm notifications carry a function
+      # name and a state reason, no customer data, so an AWS-managed key is
+      # proportionate and avoids adding a CMK (and its cost) to every deploy.
+      KmsMasterKeyId: alias/aws/sns
+      Subscription:
+        - Endpoint: !Ref AlarmEmail
+          Protocol: email
+
+  # 1) The normalizer ran and errored. Catches the per-file failure path (the
+  # handler raises when any file fails), an unhandled exception, and a timeout.
+  NormalizerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAlarms
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-normalizer-errors"
+      AlarmDescription: >
+        The Kiro report-normalizer Lambda failed. The dashboard is still
+        serving the last good data, so nothing looks broken - but no new
+        Kiro activity is being ingested until this is resolved. Check the
+        Lambda's CloudWatch logs for "FAILED to normalize <key>" lines; a
+        malformed source export is the usual cause.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref NormalizerLambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # Errors is only emitted when an invocation fails, so absent data is the
+      # healthy state and must not flip the alarm.
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  # 2) The normalizer did NOT run at all. An Errors alarm cannot see this: a
+  # disabled EventBridge rule, a deleted trigger, or a permission regression
+  # produces zero invocations and therefore zero errors, which looks identical
+  # to success. 26h of window tolerates a late run and clock skew around the
+  # daily schedule while still catching a genuinely missed day.
+  NormalizerNotRunningAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAlarms
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-normalizer-not-running"
+      AlarmDescription: >
+        The Kiro report-normalizer has not run in over 26 hours, so the
+        dashboard is going stale. Check the EventBridge rule
+        (<stack>-normalize-daily) is ENABLED and still targets the function.
+      Namespace: AWS/Lambda
+      MetricName: Invocations
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref NormalizerLambda
+      Statistic: Sum
+      Period: 93600  # 26 hours
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      # Unlike the Errors alarm, MISSING data is exactly the failure here - no
+      # invocations at all means no metric is published, so missing must breach.
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
 Outputs:
   GlueDatabaseName:
     Value: !Ref GlueDatabase
@@ -329,3 +430,9 @@ Outputs:
     Value: !Ref KiroLogsBucketName
     Export:
       Name: !Sub "${AWS::StackName}-KiroLogsBucket"
+  AlarmTopicArn:
+    Condition: HasAlarmEmail
+    Description: >
+      SNS topic for pipeline alarms. Confirm the emailed subscription before
+      notifications are delivered; add more subscribers here if needed.
+    Value: !Ref AlarmTopic

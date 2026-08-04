@@ -219,6 +219,43 @@ The four sheets:
 * **People**: Sortable All Users table (one row per user - usage is summed across the selected period even if the user changed tier, with the tier column showing their most-recent tier), a **Daily credits used (by user)** pivot (users down, dates across, credits in the cells, with per-user period totals and per-day all-user totals - exportable to CSV; carries `idc_username` beside the user when identity mapping is on, so an exported grid can be joined to your own roster), engagement segments donut, engagement funnel tiles (≥1 / ≥8 / ≥20 active days), top users by model, and a week-over-week movers table with at-risk flag. Click a row in the All Users table to drill into that user on the User detail sheet. Date-range and Tier pickers - the All Users table, engagement-segments donut, funnel tiles, and top-users-by-model are scoped to the selected range, so you can pick a month (e.g. usage that resets on the 1st) and see that period's activity; the week-over-week movers table keeps its own trailing-window logic.
 * **User detail**: Single-user drill-down. A lifetime profile strip at the top identifies the user (name/email when identity mapping is on, else the user ID) with plan tier, first/last active date, and lifetime totals - not date-filtered. Below it, the total messages, credits, and active days for the selected window, plus daily message/credit bars (which show no-activity days as gaps, not skipped) and a model split. Pick a user from the dropdown or arrive via the People click-through. Date-range and model pickers. (Because the profile is lifetime, the sheet still shows who the user is even if they had no activity in the selected window.)
 
+## Upgrading
+
+The deployed version is recorded as a `KiroAnalyticsVersion` tag on every stack, and on each QuickSight dashboard version's description. Check what you are running before anything else:
+
+```bash
+# What is deployed:
+aws cloudformation describe-stacks --stack-name "${STACK_PREFIX:-kiro-analytics}-data" \
+    --region "$AWS_REGION" \
+    --query "Stacks[0].Tags[?Key=='KiroAnalyticsVersion'].Value" --output text
+
+# What this checkout is:
+cat VERSION
+```
+
+`scripts/preflight.sh` prints both and tells you whether a re-deploy would upgrade you.
+
+If the tag is absent, the deployment predates versioning. [CHANGELOG.md](./CHANGELOG.md) has a table that identifies which release you are on from what you can see on the dashboard.
+
+To upgrade:
+
+```bash
+git pull
+scripts/preflight.sh      # confirms deployed vs checkout version
+scripts/deploy.sh         # same env vars as the original deploy
+```
+
+Re-running `deploy.sh` is the whole upgrade. It is idempotent: unchanged CloudFormation resources report "No changes", Lambda code is keyed by content hash so identical code is not re-uploaded, and the Athena views are recreated with `CREATE OR REPLACE`.
+
+Two things to know, because they are the usual cause of "I upgraded and nothing changed":
+
+* **Set the same environment variables you used the first time.** `STACK_PREFIX`, `KIRO_LOGS_BUCKET`, `IDENTITY_MAPPING`, `HASH_EMAILS` and friends all default when unset, and a deploy with `IDENTITY_MAPPING` unset is a deploy that *turns identity mapping off* - which removes the identity-map stack and purges resolved names. Keep your deploy variables in a file you re-source rather than retyping them.
+* **A view fix is not visible until SPICE re-ingests.** The datasets are SPICE import mode, so `deploy.sh` can correctly rebuild every view while the dashboard keeps serving the previous numbers until the next scheduled refresh (04:00-04:50 UTC). If you are verifying a fix, trigger a refresh with the loop under [Testing the deployment](#testing-the-deployment) and wait for it to finish before judging the result. This is the single most common reason an upgrade looks like it did nothing.
+
+Your own stack tags are preserved. `aws cloudformation deploy --tags` replaces the entire tag set rather than merging, so `deploy.sh` reads the existing tags and re-sends them alongside the version tag - a cost-allocation tag you added by hand survives an upgrade.
+
+Nothing in an upgrade touches the Kiro logs bucket, and normalized data is rewritten idempotently, so an upgrade does not lose history. Downgrades are not tested; roll back by checking out the older tag and re-deploying, then refresh SPICE.
+
 ## How it works
 
 The solution is layered:
@@ -345,7 +382,7 @@ scripts/run-checks.sh
 
 That runs everything CI runs, offline — no AWS account, no credentials, no network — in a couple of seconds:
 
-* **Unit tests** (`python3 -m unittest discover -s tests`) covering the invariants whose violation is *silent* on the dashboard: header-keyed CSV parsing as Kiro's export drifts, tier-label rendering, view dependency ordering, the dataset inventories that drive the identity-mapping opt-out, IAM policy rendering, and the dashboard definition's internal consistency.
+* **Unit tests** (`python3 -m unittest discover -s tests`) covering the invariants whose violation is *silent* on the dashboard: header-keyed CSV parsing as Kiro's export drifts, tier-label rendering, view dependency ordering, the dataset inventories that drive the identity-mapping opt-out, IAM policy rendering, version stamping (including that adding the version tag does not wipe a customer's own stack tags), and the dashboard definition's internal consistency.
 * **Shell syntax under bash 3.2 as well as bash 5** — macOS still ships 3.2, and the scripts deliberately avoid bash-4 syntax.
 * **A portability gate** rejecting bash-4-only constructs (`mapfile`, `declare -A`, `${var,,}`) and GNU-only tool usage (`sed -i`, `date -d`, `grep -P`).
 * **`shellcheck`** and **`cfn-lint`** when installed; skipped with a notice when not, so a missing linter never blocks you locally. CI installs both.

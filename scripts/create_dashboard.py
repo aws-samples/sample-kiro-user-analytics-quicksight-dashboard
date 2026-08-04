@@ -1785,7 +1785,8 @@ def build_definition(account_id: str, region: str, resource_prefix: str,
 
 
 def upsert(qs, *, account_id: str, principal_arn: str, theme_arn: str | None,
-           asset_id: str, is_dashboard: bool, definition: dict) -> str:
+           asset_id: str, is_dashboard: bool, definition: dict,
+           version: str | None = None) -> str:
     create_kwargs = {
         "AwsAccountId": account_id,
         "Name": NAME,
@@ -1839,6 +1840,20 @@ def upsert(qs, *, account_id: str, principal_arn: str, theme_arn: str | None,
     if theme_arn:
         create_kwargs["ThemeArn"] = theme_arn
         update_kwargs["ThemeArn"] = theme_arn
+
+    # Stamp the sample's version onto the dashboard version itself, so the
+    # QuickSight console's version history answers "which code produced this?"
+    # without needing CloudFormation access - the reader looking at a suspect
+    # number usually does not have it.
+    #
+    # VersionDescription exists on Create/UpdateDashboard but NOT on the Analysis
+    # operations (verified against the botocore service model), so it is set only
+    # on the dashboard path; passing it to create_analysis would raise
+    # ParamValidationError. The API caps it at 512 chars.
+    if version and is_dashboard:
+        description = f"kiro-user-analytics {version}"[:512]
+        create_kwargs["VersionDescription"] = description
+        update_kwargs["VersionDescription"] = description
 
     try:
         resp = create_fn(**create_kwargs)
@@ -1922,6 +1937,11 @@ def main() -> int:
     p.add_argument("--resource-prefix", default="kiro-analytics",
                    help="Prefix used for QuickSight DataSet IDs. Must match "
                         "the ResourcePrefix passed to the QS CFN stack.")
+    p.add_argument("--version", default=None,
+                   help="Version string from the repo's VERSION file. Recorded "
+                        "as the dashboard version's VersionDescription so a "
+                        "published dashboard can be traced back to the code "
+                        "that produced it. deploy.sh passes this automatically.")
     p.add_argument("--identity-mapping", action="store_true",
                    help="Set when IAM Identity Center user mapping is enabled. "
                         "Adds the idc_username / idc_email join-key columns to "
@@ -1937,7 +1957,8 @@ def main() -> int:
                                   identity_mapping=args.identity_mapping)
 
     common = dict(account_id=args.account_id, principal_arn=args.principal_arn,
-                  theme_arn=args.theme_arn, asset_id=args.asset_id)
+                  theme_arn=args.theme_arn, asset_id=args.asset_id,
+                  version=args.version)
     print("Upserting Analysis", file=sys.stderr)
     upsert(qs, **common, is_dashboard=False, definition=definition)
     print("Upserting Dashboard", file=sys.stderr)

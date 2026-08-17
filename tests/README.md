@@ -32,6 +32,7 @@ them (with a notice) when they are not.
 | `test_dashboard_definition.py` | Dataset references resolve, drill-through target, tier filter/display agreement | Filtering `subscription_tier` while grouping `user_tier`; a visual referencing a dataset that no longer exists |
 | `test_versioning.py` | `VERSION`/`CHANGELOG` agreement, every stack tagged, and the tag **merge** | `aws cloudformation deploy --tags` replaces rather than merges, so stamping a version tag would silently delete a customer's own cost-allocation tags — visible only weeks later in a billing report |
 | `test_cost_docs.py` | The README cost table recomputed from its own stated unit prices | A cost figure edited in one cell and left stale in another. Someone budgets from that table, so an inconsistent number is worse than no table |
+| `test_deploy_ordering.py` | Steps in `deploy.sh` that depend on something an earlier step creates | A step ordered before its dependency works on every re-deploy and fails only on a FRESH install — the path a developer never retests and every new customer takes. Log retention really was set before the invoke that creates the log group |
 | `test_helpers_stub.py` | The offline AWS stub covers every name `scripts/` imports, derived from the scripts themselves | A script importing a symbol the stub omits (`BotoCoreError` really did) fails with `cannot import name ... from 'botocore.exceptions'` — an error that points at botocore rather than at the stub |
 
 ## What these tests deliberately cannot catch
@@ -83,6 +84,7 @@ clean copy of the tree, and the suite was run.
 | `BotoCoreError` removed from the offline AWS stub | 1 failure + 1 error |
 | A brand-new AWS import the stub has never seen (`EndpointConnectionError`) | 1 failure |
 | The stub returning `None` from `boto3.client` instead of refusing | 1 failure |
+| The post-invoke log-retention call removed (a first deploy keeps unbounded logs) | 1 failure |
 | A licence-table total edited to disagree with the stated per-user price | 1 failure |
 | The "243× bill increase" multiplier changed to a wrong figure | 1 failure |
 | "Entitle fewer readers" demoted from the top cost recommendation | 1 failure |

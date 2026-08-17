@@ -355,19 +355,37 @@ NORMALIZER_LAMBDA="$(aws cloudformation describe-stacks --region "${REGION}" --s
 #
 # Without this the auto-created group NEVER expires: unbounded cost, and
 # diagnostic output (object keys, AWS error strings) retained forever.
-if [[ -n "${NORMALIZER_LAMBDA}" ]]; then
-    NRM_LOG_GROUP="/aws/lambda/${NORMALIZER_LAMBDA}"
-    if aws logs put-retention-policy --region "${REGION}" \
-            --log-group-name "${NRM_LOG_GROUP}" \
-            --retention-in-days "${LOG_RETENTION_DAYS}" >/dev/null 2>&1; then
-        echo ">> Log retention set to ${LOG_RETENTION_DAYS}d on ${NRM_LOG_GROUP}"
-    else
-        # The group does not exist until the function has run at least once.
-        # Not fatal: the next deploy (or the line above, after the synchronous
-        # invoke below) will set it.
-        echo "   (log group not present yet; retention will be set on a later run)" >&2
+#
+# Called TWICE: once here, and again after the synchronous normalizer invoke
+# below. On a FIRST deploy the function has never run, so the group does not
+# exist yet and this attempt necessarily fails - and without the second call a
+# brand-new deployment kept unbounded retention until someone happened to deploy
+# again, which is precisely the cost/retention leak this is meant to close.
+# Observed on a real first deploy, where the group was created by the invoke and
+# left with retentionInDays=None.
+set_log_retention() {
+    [[ -z "${NORMALIZER_LAMBDA}" || "${NORMALIZER_LAMBDA}" == "None" ]] && return 0
+    local group="/aws/lambda/${NORMALIZER_LAMBDA}"
+    # Already correct? Say nothing - this runs twice and one report is enough.
+    local current
+    current="$(aws logs describe-log-groups --region "${REGION}" \
+        --log-group-name-prefix "${group}" \
+        --query "logGroups[?logGroupName=='${group}'].retentionInDays | [0]" \
+        --output text 2>/dev/null || echo "")"
+    if [[ "${current}" == "${LOG_RETENTION_DAYS}" ]]; then
+        return 0
     fi
-fi
+    if aws logs put-retention-policy --region "${REGION}" \
+            --log-group-name "${group}" \
+            --retention-in-days "${LOG_RETENTION_DAYS}" >/dev/null 2>&1; then
+        echo ">> Log retention set to ${LOG_RETENTION_DAYS}d on ${group}"
+        return 0
+    fi
+    return 1
+}
+# First attempt. Silent on failure: the group legitimately does not exist yet on
+# a first deploy, and the post-invoke call below is the one that matters then.
+set_log_retention || true
 
 # 1b) Guard against a reused-prefix / changed-bucket mismatch.
 # Re-running an existing STACK_PREFIX with a different KIRO_LOGS_BUCKET reports
@@ -416,6 +434,15 @@ if [[ -n "${NORMALIZER_LAMBDA}" && "${NORMALIZER_LAMBDA}" != "None" ]]; then
         echo "   the daily schedule will retry. Check the Lambda logs." >&2
     else
         echo "   Normalizer result: $(cat "${NRM_BUILD_DIR}/invoke.json")"
+    fi
+
+    # The invoke above is what CREATES the log group on a first deploy, so this
+    # is the attempt that actually succeeds then. Without it a fresh deployment
+    # keeps Lambda's default (never expires) until some later deploy happened to
+    # run - see the note at set_log_retention.
+    if ! set_log_retention; then
+        echo "   (could not set log retention on the normalizer log group;" >&2
+        echo "    set it manually or re-run deploy.sh)" >&2
     fi
 fi
 

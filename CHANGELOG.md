@@ -88,6 +88,13 @@ release and is recorded so an existing deployment can be placed in history.
 
 ### Fixed
 
+- **A first deploy left the normalizer's log group with no expiry.** Retention was
+  applied before the synchronous normalizer invoke, but Lambda only creates the
+  log group when the function first runs — so on a fresh install the call failed
+  and was never retried, leaving Lambda's "never expires" default in place. Every
+  re-deploy looked correct because the group existed by then. Retention is now
+  attempted again after the invoke. Found by deploying a brand-new stack and
+  reading back `retentionInDays: None`.
 - **Tier labels were inconsistent** — the same tier rendered as both `PRO_PLUS`
   and `Pro+` depending on the visual. All tier rendering now goes through one
   shared expression. (#17)

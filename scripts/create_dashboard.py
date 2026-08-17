@@ -22,7 +22,31 @@ import boto3
 from botocore.exceptions import ClientError
 
 DEFAULT_ASSET_ID = "kiro-user-analytics"
-NAME = "Kiro User Analytics"
+DEFAULT_NAME = "Kiro User Analytics"
+# The STACK_PREFIX that deploy.sh itself defaults to. A deployment using it is
+# "the" deployment and keeps the plain name; anything else is a parallel
+# deployment and gets the prefix appended (see asset_name).
+DEFAULT_RESOURCE_PREFIX = "kiro-analytics"
+
+
+def asset_name(resource_prefix: str, override: str | None = None) -> str:
+    """Display name for the Analysis and Dashboard.
+
+    The asset ID is namespaced per deployment, but the display NAME was a fixed
+    constant - so several deployments in one account (dev/prod, per-Region, per-
+    org-unit) all appeared in the QuickSight console as identical rows titled
+    "Kiro User Analytics", indistinguishable without opening each one.
+
+    The prefix is appended for any non-default deployment, which guarantees
+    uniqueness because STACK_PREFIX is also the CloudFormation stack name and so
+    cannot collide. The default deployment keeps the plain name, since
+    "Kiro User Analytics (kiro-analytics)" is just noise when there is only one.
+    """
+    if override:
+        return override[:2048]
+    if resource_prefix and resource_prefix != DEFAULT_RESOURCE_PREFIX:
+        return f"{DEFAULT_NAME} ({resource_prefix})"[:2048]
+    return DEFAULT_NAME
 
 # Dataset identifier suffixes. Combined with --resource-prefix to form the
 # full DataSetId at build time. Must match the IDs minted by cfn/02-quicksight.yaml.
@@ -1786,10 +1810,10 @@ def build_definition(account_id: str, region: str, resource_prefix: str,
 
 def upsert(qs, *, account_id: str, principal_arn: str, theme_arn: str | None,
            asset_id: str, is_dashboard: bool, definition: dict,
-           version: str | None = None) -> str:
+           version: str | None = None, name: str = DEFAULT_NAME) -> str:
     create_kwargs = {
         "AwsAccountId": account_id,
-        "Name": NAME,
+        "Name": name,
         "Definition": definition,
         "Permissions": [{
             "Principal": principal_arn,
@@ -1823,7 +1847,7 @@ def upsert(qs, *, account_id: str, principal_arn: str, theme_arn: str | None,
         update_kwargs = {
             "AwsAccountId": account_id,
             "DashboardId": asset_id,
-            "Name": NAME,
+            "Name": name,
             "Definition": definition,
         }
     else:
@@ -1833,7 +1857,7 @@ def upsert(qs, *, account_id: str, principal_arn: str, theme_arn: str | None,
         update_kwargs = {
             "AwsAccountId": account_id,
             "AnalysisId": asset_id,
-            "Name": NAME,
+            "Name": name,
             "Definition": definition,
         }
 
@@ -1942,6 +1966,13 @@ def main() -> int:
                         "as the dashboard version's VersionDescription so a "
                         "published dashboard can be traced back to the code "
                         "that produced it. deploy.sh passes this automatically.")
+    p.add_argument("--name", default=None,
+                   help="Display name for the Analysis and Dashboard. Defaults "
+                        f"to '{DEFAULT_NAME}' for the default deployment and "
+                        f"'{DEFAULT_NAME} (<resource-prefix>)' for any other, so "
+                        "parallel deployments are distinguishable in the "
+                        "QuickSight console instead of appearing as identical "
+                        "rows.")
     p.add_argument("--identity-mapping", action="store_true",
                    help="Set when IAM Identity Center user mapping is enabled. "
                         "Adds the idc_username / idc_email join-key columns to "
@@ -1956,9 +1987,11 @@ def main() -> int:
                                   args.resource_prefix,
                                   identity_mapping=args.identity_mapping)
 
+    name = asset_name(args.resource_prefix, args.name)
     common = dict(account_id=args.account_id, principal_arn=args.principal_arn,
                   theme_arn=args.theme_arn, asset_id=args.asset_id,
-                  version=args.version)
+                  version=args.version, name=name)
+    print(f"Asset name: {name}", file=sys.stderr)
     print("Upserting Analysis", file=sys.stderr)
     upsert(qs, **common, is_dashboard=False, definition=definition)
     print("Upserting Dashboard", file=sys.stderr)

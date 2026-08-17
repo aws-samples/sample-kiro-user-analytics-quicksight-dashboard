@@ -16,6 +16,13 @@
 #                        use an existing role under QuickSight -> Manage
 #                        account -> Permissions -> IAM role.
 #   THEME_MODE         - default light. Set to dark for a dark-mode dashboard.
+#   DASHBOARD_NAME     - display name for the Analysis and Dashboard in the
+#                        QuickSight console. Defaults to "Kiro User Analytics"
+#                        for the default STACK_PREFIX and
+#                        "Kiro User Analytics (<STACK_PREFIX>)" for any other, so
+#                        parallel deployments are told apart in the console
+#                        rather than showing as identical rows. Set this to
+#                        override with something meaningful ("Kiro - EU Prod").
 #   AUTO_APPROVE_IAM   - default false. Set to true to apply the QS S3 inline
 #                        policy without prompting (CI / scripted deploys).
 #   ALARM_EMAIL        - default "" (no alarms). Email to notify if the
@@ -62,6 +69,8 @@ HASH_EMAILS="${HASH_EMAILS:-false}"
 KMS_KEY_ARN="${KMS_KEY_ARN:-}"
 QS_IAM_ROLE_NAME="${QS_IAM_ROLE_NAME:-aws-quicksight-service-role-v0}"
 THEME_MODE="${THEME_MODE:-light}"
+# Empty means "let create_dashboard.py derive it from STACK_PREFIX".
+DASHBOARD_NAME="${DASHBOARD_NAME:-}"
 IDENTITY_MAPPING="${IDENTITY_MAPPING:-false}"
 IDENTITY_STORE_ID="${IDENTITY_STORE_ID:-}"
 IDC_REGION="${IDC_REGION:-}"
@@ -746,6 +755,7 @@ python3 "${ROOT}/scripts/create_dashboard.py" \
     --asset-id "${ASSET_ID}" \
     --resource-prefix "${STACK_PREFIX}" \
     --version "${VERSION}" \
+    ${DASHBOARD_NAME:+--name "${DASHBOARD_NAME}"} \
     ${THEME_ARN:+--theme-arn "${THEME_ARN}"} \
     ${IDMAP_BUCKET:+--identity-mapping}
 

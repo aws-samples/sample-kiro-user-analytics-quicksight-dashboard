@@ -163,6 +163,49 @@ class TestDrillThrough(unittest.TestCase):
         self.assertIn("DrillUser", actions, "no DrillUser set-parameter action")
 
 
+class TestAssetName(unittest.TestCase):
+    """Parallel deployments must be distinguishable in the QuickSight console.
+
+    The asset ID was namespaced per deployment but the display NAME was a fixed
+    constant, so four deployments in one account showed as four identical rows
+    titled "Kiro User Analytics" - you had to open each one to tell which was
+    which. STACK_PREFIX is also the CloudFormation stack name, so deriving from
+    it cannot collide.
+    """
+
+    def test_distinct_prefixes_give_distinct_names(self):
+        prefixes = ["kiro-analytics", "kiro-euc1", "kiro-synthetic", "kiro-xregion"]
+        names = [cd.asset_name(p) for p in prefixes]
+        self.assertEqual(len(set(names)), len(prefixes),
+                         f"duplicate console names: {names}")
+
+    def test_default_deployment_keeps_the_plain_name(self):
+        """'Kiro User Analytics (kiro-analytics)' is noise when there is one."""
+        self.assertEqual(cd.asset_name(cd.DEFAULT_RESOURCE_PREFIX), cd.DEFAULT_NAME)
+
+    def test_non_default_prefix_is_visible_in_the_name(self):
+        name = cd.asset_name("kiro-euc1")
+        self.assertIn("kiro-euc1", name)
+        self.assertIn(cd.DEFAULT_NAME, name)
+
+    def test_explicit_override_wins(self):
+        self.assertEqual(cd.asset_name("kiro-euc1", "Kiro - EU Prod"), "Kiro - EU Prod")
+
+    def test_name_respects_the_api_length_cap(self):
+        """QuickSight caps Name at 2048 chars; a long prefix must not make the
+        call fail after the datasets already exist."""
+        for prefix, override in (("x" * 4000, None), ("p", "y" * 4000)):
+            with self.subTest(prefix=prefix[:12], override=bool(override)):
+                self.assertLessEqual(len(cd.asset_name(prefix, override)), 2048)
+
+    def test_upsert_sends_the_name_on_both_create_and_update(self):
+        """Update must carry it too, or an existing deployment would keep its old
+        duplicate name forever."""
+        src = (cd.__file__ and open(cd.__file__).read()) or ""
+        self.assertEqual(src.count('"Name": name,'), 3,
+                         "expected Name wired into create + both update paths")
+
+
 class TestIdentityColumns(unittest.TestCase):
 
     def test_identity_columns_appear_only_when_mapping_is_on(self):

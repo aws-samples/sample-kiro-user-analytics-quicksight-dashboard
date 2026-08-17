@@ -88,6 +88,14 @@ release and is recorded so an existing deployment can be placed in history.
 
 ### Fixed
 
+- **Parallel deployments all showed the same name in the QuickSight console.** The
+  asset ID was namespaced per deployment but the display name was a fixed
+  constant, so four deployments appeared as four identical rows titled
+  "Kiro User Analytics" and you had to open each to tell them apart. The name now
+  derives from `STACK_PREFIX` — the default deployment keeps the plain name, any
+  other gets `Kiro User Analytics (<prefix>)` — and `DASHBOARD_NAME` overrides it
+  outright. Renaming an existing deployment is safe: the asset ID does not change,
+  so URLs, permissions and bookmarks survive.
 - **A first deploy left the normalizer's log group with no expiry.** Retention was
   applied before the synchronous normalizer invoke, but Lambda only creates the
   log group when the function first runs — so on a fresh install the call failed

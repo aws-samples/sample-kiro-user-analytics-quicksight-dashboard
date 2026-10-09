@@ -31,6 +31,7 @@ If that returns nothing, the deployment predates versioning (anything before
 
 | What you observe | Your deployment predates |
 |---|---|
+| The User detail **Users** picker selects only one user, and there is no *Usage in selected period (by user)* table | 1.1.0 |
 | Five sheets, including an **Executive** sheet | 1.0.0 (#11, 2026-06-12) |
 | An **AWS Glue crawler** in the stack rather than a `normalize-report` Lambda | 1.0.0 (#10, 2026-06-08) |
 | Tier reads **`PRO_PLUS`** rather than **`Pro+`** | 1.0.0 (#17, 2026-07-28) |
@@ -42,6 +43,72 @@ In every case the fix is `git pull` then re-run `scripts/deploy.sh` — see
 [Upgrading](./README.md#upgrading) in the README, and note the SPICE-refresh step
 there, because a view change is **not** visible until the data is re-ingested.
 
+## [1.1.0] - 2026-10-09
+
+A plain re-deploy picks all of this up. No Athena view changed, so no SPICE
+refresh is needed for 1.1.0 itself.
+
+Correction to the record: the changes from #31 to #35 below were first written
+into the 1.0.0 entry *after* 1.0.0 had already been stamped onto deployments, so
+a stack tagged `KiroAnalyticsVersion=1.0.0` may or may not contain them. Moving
+them here is the fix; a deployment that re-runs `deploy.sh` at 1.1.0 is
+unambiguous again.
+
+### Added
+
+- **The User detail sheet accepts several users at once.** The user picker is now
+  multi-select, so you can read usage for a specific list of people — one team,
+  a chargeback group — in one place instead of one user at a time. A new
+  **Usage in selected period (by user)** table gives each selected person's
+  messages, credits, overage and active days for the chosen date range, and can
+  be exported to CSV. It was needed because the existing profile strip is
+  lifetime and the KPI tiles are group totals, so neither answered "what did
+  each of these people use in this window?". Its numbers match the People
+  sheet's All users table exactly (same dataset, columns and aggregation). The
+  People click-through still opens exactly the one clicked user. With several
+  users selected, the KPI tiles and daily charts show the group's combined
+  totals; *Active days* there counts days on which anyone selected was active,
+  so use the per-user table for each person's count.
+- A **Cost** section in the README, measured on live deployments rather than
+  estimated. The headline: the data pipeline runs at about **$0.05/month** and is
+  irrelevant to the budget, while QuickSight reader licences range from $99 to
+  **$24,024/month** for the same dashboard — so entitling every Kiro seat instead
+  of the people who act on the data is a 243× bill increase that no deploy warns
+  about. Also documents the flat **$250/month** account fee triggered by any Pro
+  user or Amazon Q in QuickSight (~6,000× the pipeline), with the CLI command to
+  check whether it already applies. (#31)
+- `scripts/check_pricing.py`, which diffs the README's documented prices against
+  the live AWS Price List API and exits non-zero on drift. The offline tests can
+  only catch a cost figure that contradicts its own table; they cannot notice AWS
+  repricing, which would leave every test green and the whole Cost section wrong.
+  Run at each release (see CONTRIBUTING.md); deliberately not in CI, since it
+  needs credentials and a price change is not a contributor's fault. (#32)
+
+### Fixed
+
+- **Parallel deployments all showed the same name in the QuickSight console.** The
+  asset ID was namespaced per deployment but the display name was a fixed
+  constant, so four deployments appeared as four identical rows titled
+  "Kiro User Analytics" and you had to open each to tell them apart. The name now
+  derives from `STACK_PREFIX` — the default deployment keeps the plain name, any
+  other gets `Kiro User Analytics (<prefix>)` — and `DASHBOARD_NAME` overrides it
+  outright. Renaming an existing deployment is safe: the asset ID does not change,
+  so URLs, permissions and bookmarks survive. (#35)
+- **A first deploy left the normalizer's log group with no expiry.** Retention was
+  applied before the synchronous normalizer invoke, but Lambda only creates the
+  log group when the function first runs — so on a fresh install the call failed
+  and was never retried, leaving Lambda's "never expires" default in place. Every
+  re-deploy looked correct because the group existed by then. Retention is now
+  attempted again after the invoke. Found by deploying a brand-new stack and
+  reading back `retentionInDays: None`. (#34)
+- The offline test harness could run code that was no longer on disk. Python's
+  bytecode cache trusts a source file's mtime (1-second resolution) and size, so
+  a same-size edit tested within the same second executed the previous
+  bytecode. Found while mutation-testing this release, when a reverted file was
+  still reported as mutated. Tests now always compile from source.
+- The offline stub omitted `BotoCoreError`, and the account-ID hygiene check
+  missed any ID that did not start with 7 or sat at the end of a line. (#33)
+
 ## [1.0.0] - 2026-08-04
 
 First versioned release. Functionally this is the state reached by PR #29; the
@@ -50,20 +117,6 @@ release and is recorded so an existing deployment can be placed in history.
 
 ### Added
 
-- A **Cost** section in the README, measured on live deployments rather than
-  estimated. The headline: the data pipeline runs at about **$0.05/month** and is
-  irrelevant to the budget, while QuickSight reader licences range from $99 to
-  **$24,024/month** for the same dashboard — so entitling every Kiro seat instead
-  of the people who act on the data is a 243× bill increase that no deploy warns
-  about. Also documents the flat **$250/month** account fee triggered by any Pro
-  user or Amazon Q in QuickSight (~6,000× the pipeline), with the CLI command to
-  check whether it already applies.
-- `scripts/check_pricing.py`, which diffs the README's documented prices against
-  the live AWS Price List API and exits non-zero on drift. The offline tests can
-  only catch a cost figure that contradicts its own table; they cannot notice AWS
-  repricing, which would leave every test green and the whole Cost section wrong.
-  Run at each release (see CONTRIBUTING.md); deliberately not in CI, since it
-  needs credentials and a price change is not a contributor's fault.
 - Offline test suite (83 tests) and GitHub Actions CI covering the bug classes
   that fail *silently* on the dashboard: dataset-inventory drift, tier-label
   handling, per-user-constant columns, view creation order, IAM policy shape and
@@ -88,21 +141,6 @@ release and is recorded so an existing deployment can be placed in history.
 
 ### Fixed
 
-- **Parallel deployments all showed the same name in the QuickSight console.** The
-  asset ID was namespaced per deployment but the display name was a fixed
-  constant, so four deployments appeared as four identical rows titled
-  "Kiro User Analytics" and you had to open each to tell them apart. The name now
-  derives from `STACK_PREFIX` — the default deployment keeps the plain name, any
-  other gets `Kiro User Analytics (<prefix>)` — and `DASHBOARD_NAME` overrides it
-  outright. Renaming an existing deployment is safe: the asset ID does not change,
-  so URLs, permissions and bookmarks survive.
-- **A first deploy left the normalizer's log group with no expiry.** Retention was
-  applied before the synchronous normalizer invoke, but Lambda only creates the
-  log group when the function first runs — so on a fresh install the call failed
-  and was never retried, leaving Lambda's "never expires" default in place. Every
-  re-deploy looked correct because the group existed by then. Retention is now
-  attempted again after the invoke. Found by deploying a brand-new stack and
-  reading back `retentionInDays: None`.
 - **Tier labels were inconsistent** — the same tier rendered as both `PRO_PLUS`
   and `Pro+` depending on the visual. All tier rendering now goes through one
   shared expression. (#17)
@@ -151,4 +189,5 @@ release and is recorded so an existing deployment can be placed in history.
   refresh schedules. Verified by byte-comparing the generated dashboard
   definition before and after. (#27)
 
+[1.1.0]: https://github.com/aws-samples/sample-kiro-user-analytics-quicksight-dashboard/releases/tag/v1.1.0
 [1.0.0]: https://github.com/aws-samples/sample-kiro-user-analytics-quicksight-dashboard/releases/tag/v1.0.0

@@ -84,6 +84,10 @@ clean copy of the tree, and the suite was run.
 | `BotoCoreError` removed from the offline AWS stub | 1 failure + 1 error |
 | A brand-new AWS import the stub has never seen (`EndpointConnectionError`) | 1 failure |
 | The stub returning `None` from `boto3.client` instead of refusing | 1 failure |
+| `DrillUser` back to `SINGLE_VALUED` (User detail accepts one user only) | 1 failure |
+| User picker back to a `SINGLE_SELECT` control | 1 failure |
+| `models` dropped from the User-detail drill filter (model split shows everyone) | 1 failure |
+| Per-user period table aggregating `credits_used` with `MAX` instead of `SUM` | 1 failure |
 | The post-invoke log-retention call removed (a first deploy keeps unbounded logs) | 1 failure |
 | A licence-table total edited to disagree with the stated per-user price | 1 failure |
 | The "243× bill increase" multiplier changed to a wrong figure | 1 failure |
@@ -100,3 +104,5 @@ with a plain `read -r key value` left the suite green. The tests covered spaces 
 tag *values* but not in tag *keys*, and `Cost Center` is a perfectly legal — and
 common — CloudFormation tag key that whitespace splitting would corrupt into a
 different tag. `test_keys_containing_spaces_survive` closes that gap.
+
+A second lesson came from the harness rather than the tests: one *reverted* file was still reported as mutated. Python's bytecode cache trusts a source file's mtime (1-second resolution) and size, and a `SUM` -> `MAX` edit keeps the size identical - so a restore and a test run inside the same second executed the mutated bytecode. `load()` in `_helpers.py` now always compiles from source, which matters most exactly when you are doing this kind of rapid mutate-and-revert check.

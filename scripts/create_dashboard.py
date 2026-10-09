@@ -1079,8 +1079,10 @@ def build_definition(account_id: str, region: str, resource_prefix: str,
         },
 
         # ----- User detail (drill) ---------------------------------------
-        # Pick one user from the dropdown above; every visual on this sheet
-        # filters to just that user via the DrillUser parameter.
+        # Pick one or more users from the dropdown above; every visual on this
+        # sheet filters to exactly that set via the DrillUser parameter. With
+        # several selected, the KPIs and daily charts are the GROUP's totals and
+        # u-period-users breaks them down per person.
         {
             "SheetId": "user-detail",
             "Name": "User detail",
@@ -1117,7 +1119,7 @@ def build_definition(account_id: str, region: str, resource_prefix: str,
                                ("credits_used",         "MAX"),
                                ("overage_credits_used", "MAX"),
                            ]),
-                     "Identity and lifetime context for the selected user (all-time, not affected by the date picker): user (name/email if identity mapping is on, else the user ID), plan tier, first/last active date, and lifetime active days / messages / credits (incl. overage credits, which are non-zero only if the user has exceeded plan capacity). The KPIs and charts below are scoped to the selected date window."),
+                     "Identity and lifetime context for each selected user (all-time, not affected by the date picker): user (name/email if identity mapping is on, else the user ID), plan tier, first/last active date, and lifetime active days / messages / credits (incl. overage credits, which are non-zero only if the user has exceeded plan capacity). The KPIs, the per-user table and the charts below are scoped to the selected date window."),
                 # KPIs read `base` (per-day fact table) so the date picker
                 # filters them. They show the WINDOW TOTAL (sum/distinct over
                 # the whole selected range) - NOT a sparkline. A KPI with a
@@ -1127,9 +1129,9 @@ def build_definition(account_id: str, region: str, resource_prefix: str,
                 # with no trend group; the day-by-day view lives in the daily
                 # charts directly below.
                 _sub(_kpi("u-msgs",   "Messages",      "base", "total_messages", "SUM"),
-                     "Total messages this user sent across the selected date window."),
+                     "Total messages sent by the selected user(s) across the selected date window."),
                 _sub(_kpi("u-credits","Credits",       "base", "credits_used",   "SUM"),
-                     "Total credit consumption for this user across the selected window."),
+                     "Total credit consumption of the selected user(s) across the selected window."),
                 # Active days = distinct_count(activity_date) via the
                 # active_days_calc calculated field (pre-aggregated, so no
                 # AggregationFunction). base has one row per (user, day,
@@ -1137,28 +1139,53 @@ def build_definition(account_id: str, region: str, resource_prefix: str,
                 # active on two clients the same day; the distinct-count calc
                 # field avoids that.
                 _sub(_kpi_calc("u-days", "Active days", "base", "active_days_calc"),
-                     "Distinct days this user was active across the selected window."),
+                     "Distinct days on which any selected user was active across the selected window. With several users selected this is NOT the sum of their active days - see the per-user table below for each person's count."),
+                # Per-user usage for the SELECTED WINDOW. The profile strip above
+                # is lifetime and the KPIs are group totals, so without this the
+                # sheet could not answer "what did each of these people use from
+                # Sep 1 to Oct 9?" - which is what selecting several users is for.
+                # Reads `base`, so fg-date-base and fg-drill-base (both scoped to
+                # every visual on this sheet) apply to it. Columns deliberately
+                # mirror p-all-users on People: same dataset, same aggregation,
+                # so the two tables agree to the cent for any user in both, and
+                # this one is simply that table narrowed to the selection.
+                _sub(_table("u-period-users", "Usage in selected period (by user)",
+                           "base",
+                           dimensions=["user_label", *idc_dims, "user_tier"],
+                           values=[
+                               ("total_messages",       "SUM"),
+                               ("chat_conversations",   "SUM"),
+                               ("credits_used",         "SUM"),
+                               ("overage_credits_used", "SUM"),
+                               ("active_days_calc",     None),
+                           ],
+                           sort_by=("credits_used", "DESC")),
+                     "One row per selected user, summed over the date range above - the per-person breakdown of the Messages / Credits / Active days totals. Not affected by the Model picker (Kiro reports credits per user, not per model). To download: visual menu (top-right) > Export to CSV."),
                 # Read `dense` (user_daily_dense) NOT `base`: the dense view
                 # fills no-activity days with zero rows across the user's active
                 # span, so weekends/gaps render as empty bars instead of being
                 # silently skipped (which made sparse usage look continuous).
                 _sub(_bar_time_stacked("u-daily",   "Daily messages",          "dense", "activity_date", "total_messages"),
-                     "Per-day message volume for the selected user. Days with no activity show as gaps, not skipped."),
+                     "Per-day message volume for the selected user(s), summed when several are selected. Days with no activity show as gaps, not skipped."),
                 _sub(_bar_time_stacked("u-credits-line", "Daily credits used", "dense", "activity_date", "credits_used"),
-                     "Per-day credit consumption for the selected user. Days with no activity show as gaps, not skipped."),
+                     "Per-day credit consumption for the selected user(s), summed when several are selected. Days with no activity show as gaps, not skipped."),
                 _sub(_pie("u-models", "Model split",               "models", "model_name", "messages"),
-                     "How this user's messages are distributed across models."),
+                     "How the selected user(s)' messages are distributed across models."),
             ],
             "Layouts": [{"Configuration": _grid([
                 # Lifetime profile strip leads (whole-history context), then
-                # the windowed KPIs, daily trends, and model split below it.
-                ("u-profile",     0,  0, 36, 4),
-                ("u-msgs",        0,  4, 12, 5),
-                ("u-credits",    12,  4, 12, 5),
-                ("u-days",       24,  4, 12, 5),
-                ("u-daily",       0,  9, 36, 8),
-                ("u-credits-line",0, 17, 36, 8),
-                ("u-models",      0, 25, 36, 9),
+                # the windowed KPIs, the per-user windowed breakdown, daily
+                # trends, and model split below it. The profile strip is taller
+                # than it was for one user so several selected users fit
+                # without an immediate scroll.
+                ("u-profile",       0,  0, 36, 6),
+                ("u-msgs",          0,  6, 12, 5),
+                ("u-credits",      12,  6, 12, 5),
+                ("u-days",         24,  6, 12, 5),
+                ("u-period-users",  0, 11, 36, 8),
+                ("u-daily",         0, 19, 36, 8),
+                ("u-credits-line",  0, 27, 36, 8),
+                ("u-models",        0, 35, 36, 9),
             ])}],
         },
     ]
@@ -1209,12 +1236,21 @@ def build_definition(account_id: str, region: str, resource_prefix: str,
                 },
             },
         },
-        # Single-user drill picker on the User detail sheet. SINGLE_VALUED
-        # so the visuals can confidently render a single user's history.
-        # Defaults to the lexically-first user_label so the page isn't blank.
+        # User picker on the User detail sheet. MULTI_VALUED so an admin can
+        # select a LIST of people (e.g. one team, for a chargeback) and read
+        # their usage together; it was SINGLE_VALUED, which made "usage for
+        # these 12 employees" twelve separate round trips. Same parameter shape
+        # as SelectedModel / SelectedTier, so it behaves the same way: the
+        # dropdown's "Select all" means everyone, and the People click-through
+        # still sets exactly the one clicked user.
+        #
+        # No calculated field may reference ${DrillUser} as a scalar - a
+        # multi-valued parameter has no single value to compare against. It is
+        # consumed only by the EQUALS CategoryFilters in fg-drill-*, which do
+        # support a value list (tests/test_dashboard_definition.py pins this).
         {
             "StringParameterDeclaration": {
-                "ParameterValueType": "SINGLE_VALUED",
+                "ParameterValueType": "MULTI_VALUED",
                 "Name": "DrillUser",
                 "DefaultValues": {
                     "DynamicValue": {
@@ -1391,9 +1427,13 @@ def build_definition(account_id: str, region: str, resource_prefix: str,
         {
             "Dropdown": {
                 "ParameterControlId": "drill-user-picker",
-                "Title": "User",
+                "Title": "Users",
                 "SourceParameterName": "DrillUser",
-                "Type": "SINGLE_SELECT",
+                # MULTI_SELECT to match the MULTI_VALUED DrillUser. "Select all"
+                # is visible so clearing a selection is one click (it is also
+                # how to deselect everyone before picking a short list).
+                "DisplayOptions": {"SelectAllOptions": {"Visibility": "VISIBLE"}},
+                "Type": "MULTI_SELECT",
                 "SelectableValues": {
                     "LinkToDataSetColumn": {
                         "DataSetIdentifier": "users",
@@ -1410,8 +1450,10 @@ def build_definition(account_id: str, region: str, resource_prefix: str,
     filter_groups = []
 
     # Drill filter on the User-detail sheet. Filters the datasets that page
-    # reads from to the single user picked in the dropdown. `dense` is the
-    # gap-filled per-user daily series behind the daily Messages/Credits bars.
+    # reads from to the user(s) picked in the dropdown. EQUALS against a
+    # MULTI_VALUED parameter matches ANY of the selected values - the same
+    # mechanism the Tier and Model pickers rely on. `dense` is the gap-filled
+    # per-user daily series behind the daily Messages/Credits bars.
     for dataset_id in ("users", "base", "models", "dense"):
         filter_groups.append({
             "FilterGroupId": f"fg-drill-{dataset_id}",

@@ -163,6 +163,110 @@ class TestDrillThrough(unittest.TestCase):
         self.assertIn("DrillUser", actions, "no DrillUser set-parameter action")
 
 
+class TestUserDetailMultiSelect(unittest.TestCase):
+    """User detail must accept a LIST of users. A customer needed usage for a
+    specific set of employees and the sheet allowed one at a time.
+
+    Multi-select alone was not enough: the profile strip is lifetime and the KPI
+    tiles are group totals, so neither answers "what did each of these people use
+    in this window?". The per-user period table is what makes the selection
+    useful, so it is pinned here alongside the parameter."""
+
+    def _param(self, d, name):
+        for p in d["ParameterDeclarations"]:
+            decl = p.get("StringParameterDeclaration")
+            if decl and decl["Name"] == name:
+                return decl
+        self.fail(f"no string parameter {name}")
+
+    def _sheet(self, d, sheet_id):
+        return next(s for s in d["Sheets"] if s["SheetId"] == sheet_id)
+
+    def test_drill_user_is_multi_valued(self):
+        self.assertEqual(self._param(definition(), "DrillUser")["ParameterValueType"],
+                         "MULTI_VALUED")
+
+    def test_user_picker_is_a_multi_select_dropdown(self):
+        """A MULTI_VALUED parameter behind a SINGLE_SELECT control can still only
+        ever receive one value from the UI - the control is what the user sees."""
+        controls = self._sheet(definition(), "user-detail")["ParameterControls"]
+        picker = next(c["Dropdown"] for c in controls
+                      if c.get("Dropdown", {}).get("SourceParameterName") == "DrillUser")
+        self.assertEqual(picker["Type"], "MULTI_SELECT")
+        self.assertEqual(picker["DisplayOptions"]["SelectAllOptions"]["Visibility"], "VISIBLE")
+
+    def test_no_calculated_field_uses_drill_user_as_a_scalar(self):
+        """A multi-valued parameter has no single value. A calc field comparing
+        against ${DrillUser} would silently misbehave once it became a list."""
+        for mapping in (False, True):
+            for cf in definition(mapping)["CalculatedFields"]:
+                with self.subTest(identity_mapping=mapping, field=cf["Name"]):
+                    self.assertNotIn("${DrillUser}", cf["Expression"])
+
+    def test_every_user_detail_dataset_is_filtered_by_the_selection(self):
+        """If one dataset escapes the drill filter, its visuals show EVERYONE
+        while the rest of the sheet shows the selection - a silent mismatch."""
+        d = definition()
+        visual_datasets = set(re.findall(r'"DataSetIdentifier":\s*"([^"]+)"',
+                                         json.dumps(self._sheet(d, "user-detail")["Visuals"])))
+        drilled = set()
+        for fg in d["FilterGroups"]:
+            f = fg["Filters"][0].get("CategoryFilter", {})
+            cfg = f.get("Configuration", {}).get("CustomFilterConfiguration", {})
+            if cfg.get("ParameterName") == "DrillUser":
+                scopes = fg["ScopeConfiguration"]["SelectedSheets"]["SheetVisualScopingConfigurations"]
+                if any(s["SheetId"] == "user-detail" and s["Scope"] == "ALL_VISUALS" for s in scopes):
+                    self.assertEqual(cfg["MatchOperator"], "EQUALS")
+                    drilled.add(f["Column"]["DataSetIdentifier"])
+        self.assertLessEqual(visual_datasets, drilled,
+                             f"User-detail datasets not filtered by the user "
+                             f"selection: {sorted(visual_datasets - drilled)}")
+
+    def test_per_user_period_table_exists_and_is_windowed(self):
+        """The visual that turns a multi-selection into per-person numbers. It
+        must read `base` (date-filtered on this sheet), not the lifetime
+        `users` dataset, or it would repeat the profile strip."""
+        for mapping in (False, True):
+            d = definition(mapping)
+            table = next((cfg for sid, _, cfg in visuals(d)
+                          if sid == "user-detail" and cfg["VisualId"] == "u-period-users"), None)
+            with self.subTest(identity_mapping=mapping):
+                self.assertIsNotNone(table, "u-period-users missing from User detail")
+                wells = table["ChartConfiguration"]["FieldWells"]["TableAggregatedFieldWells"]
+                first = wells["GroupBy"][0]["CategoricalDimensionField"]["Column"]
+                self.assertEqual(first, {"DataSetIdentifier": "base", "ColumnName": "user_label"})
+                date_fg = next(fg for fg in d["FilterGroups"] if fg["FilterGroupId"] == "fg-date-base")
+                scopes = date_fg["ScopeConfiguration"]["SelectedSheets"]["SheetVisualScopingConfigurations"]
+                self.assertTrue(any(s["SheetId"] == "user-detail" and s["Scope"] == "ALL_VISUALS"
+                                    for s in scopes),
+                                "base is not date-filtered on User detail")
+
+    def test_per_user_table_agrees_with_the_people_table(self):
+        """Same dataset, same columns, same aggregations as p-all-users, so a
+        user's numbers match to the cent on both sheets. Divergence here is how
+        two tables end up disagreeing and a customer stops trusting both."""
+        def wells(vid):
+            cfg = next(c for _, _, c in visuals(definition(True)) if c["VisualId"] == vid)
+            w = cfg["ChartConfiguration"]["FieldWells"]["TableAggregatedFieldWells"]
+            field = lambda x: next(iter(x.values()))  # unwrap {"<Kind>Field": {...}}
+            dims = [field(x)["Column"]["ColumnName"] for x in w["GroupBy"]]
+            vals = [(field(x)["Column"]["ColumnName"],
+                     json.dumps(field(x).get("AggregationFunction"), sort_keys=True))
+                    for x in w["Values"]]
+            return dims, vals
+        self.assertEqual(wells("u-period-users"), wells("p-all-users"))
+
+    def test_people_click_through_still_targets_the_picker(self):
+        """Clicking a row on People must still land on that one user."""
+        d = definition()
+        table = next(cfg for _, _, cfg in visuals(d) if cfg["VisualId"] == "p-all-users")
+        ops = [op for a in table["Actions"] for op in a["ActionOperations"]]
+        dests = [c["DestinationParameterName"]
+                 for op in ops if "SetParametersOperation" in op
+                 for c in op["SetParametersOperation"]["ParameterValueConfigurations"]]
+        self.assertEqual(dests, ["DrillUser"])
+
+
 class TestAssetName(unittest.TestCase):
     """Parallel deployments must be distinguishable in the QuickSight console.
 

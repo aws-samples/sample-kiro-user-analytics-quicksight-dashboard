@@ -110,7 +110,15 @@ def load(module_name: str):
     mod = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = mod
     try:
-        spec.loader.exec_module(mod)
+        # Compile from the SOURCE, never from __pycache__. The loader's staleness
+        # check compares only the source's mtime (1-second resolution) and size,
+        # so an edit that keeps the size identical ("SUM" -> "MAX") and is
+        # followed by a test run within the same second executes the OLD
+        # bytecode - the tests then pass or fail against code that is not on
+        # disk. That really happened while mutation-testing: a reverted file was
+        # reported as still mutated. run-checks.sh's compileall step writes those
+        # .pyc files, so this is not hypothetical in an edit-test loop either.
+        exec(compile(path.read_text(), str(path), "exec"), mod.__dict__)
     except BaseException:
         # NEVER leave a half-executed module cached. module_from_spec registers
         # it before exec, so a failed import would otherwise be served to every
